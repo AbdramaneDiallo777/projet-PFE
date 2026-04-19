@@ -324,7 +324,7 @@ export async function fetchParcelles(): Promise<ApiParcelle[]> {
 
 /** Parcelles du membre connecté — GET /api/v1/parcelles/me */
 export async function fetchMyParcelles(token: string): Promise<ApiParcelle[]> {
-  const res = await apiFetch(apiV1("/parcelles/me"), {
+  const res = await apiFetch(`${API_BASE_URL}/api/parcelles/me`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   const raw = await res.json().catch(() => null);
@@ -1031,9 +1031,10 @@ export type ConversationSummary = {
 export async function fetchConversations(
   token: string
 ): Promise<ConversationSummary[]> {
-  const res = await apiFetch(apiV1("/messages/conversations"), {
+  const res = await apiFetch(`${API_BASE_URL}/api/messages/conversations`, {
     headers: { Authorization: `Bearer ${token}` },
   });
+  if (res.status === 404) return [];
   if (!res.ok) {
     const t = await res.text();
     throw new Error(t || `Conversations ${res.status}`);
@@ -1055,9 +1056,13 @@ export async function fetchConversationMessages(
   token: string,
   otherUserId: number
 ): Promise<ApiMessage[]> {
-  const res = await apiFetch(apiV1(`/messages/conversation/${otherUserId}`), {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const res = await apiFetch(
+    `${API_BASE_URL}/api/messages/conversation/${otherUserId}`,
+    {
+      headers: { Authorization: `Bearer ${token}` },
+    }
+  );
+  if (res.status === 404) return [];
   if (!res.ok) {
     const t = await res.text();
     throw new Error(t || `Messages ${res.status}`);
@@ -1071,7 +1076,7 @@ export async function sendApiMessage(
   content: string,
   productId?: number | null
 ): Promise<ApiMessage> {
-  const res = await apiFetch(apiV1("/messages/"), {
+  const res = await apiFetch(`${API_BASE_URL}/api/messages/`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

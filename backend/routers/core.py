@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
 from backend.database import get_agronomie_since, get_all_agronomie
 from backend.models import (
@@ -101,3 +102,38 @@ async def agronomie_refresh() -> dict:
         return {"status": "ok", **result}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+# --- Messagerie B2B : stubs (évite 404 si l’app appelle encore /api/messages/*) ---
+
+
+@router.get("/messages/conversations")
+async def messages_conversations_list() -> list:
+    """Liste des conversations — non implémentée en MVP."""
+    return []
+
+
+@router.get("/messages/conversation/{other_user_id:int}")
+async def messages_conversation_thread(other_user_id: int) -> list:
+    """Fil de messages — non implémenté en MVP."""
+    return []
+
+
+class MessageSendBody(BaseModel):
+    receiver_id: int
+    content: str = ""
+    product_id: int | None = None
+
+
+@router.post("/messages/")
+async def messages_send_stub(body: MessageSendBody) -> dict:
+    """Accusé minimal pour ne pas casser l’UI ; persistance absente en MVP."""
+    return {
+        "id": 0,
+        "sender_id": 0,
+        "receiver_id": body.receiver_id,
+        "product_id": body.product_id,
+        "content": body.content,
+        "is_read": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }

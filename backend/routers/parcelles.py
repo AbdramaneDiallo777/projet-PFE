@@ -7,9 +7,10 @@ from pydantic import BaseModel, Field
 from backend.database import (
     get_parcelles_last_updated_ms,
     list_all_parcelles_for_sync,
+    list_parcelles_for_owner,
     upsert_parcelle_row,
 )
-from backend.dependencies import get_current_user_optional
+from backend.dependencies import get_current_user, get_current_user_optional
 
 router = APIRouter(prefix="/parcelles", tags=["Parcelles"])
 
@@ -39,6 +40,12 @@ class BulkParcellesBody(BaseModel):
 class SyncResponse(BaseModel):
     parcelles: list[dict[str, Any]]
     last_updated: int
+
+
+@router.get("/me", response_model=list[dict[str, Any]])
+async def my_parcelles(user=Depends(get_current_user)) -> list[dict[str, Any]]:
+    """Parcelles enregistrées pour le compte connecté (producteur / pro)."""
+    return await list_parcelles_for_owner(user["id"])
 
 
 @router.get("/sync", response_model=SyncResponse)

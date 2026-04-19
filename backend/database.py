@@ -325,6 +325,24 @@ async def list_all_parcelles_for_sync() -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+async def list_parcelles_for_owner(owner_id: UUID) -> list[dict[str, Any]]:
+    """Parcelles dont `owner_user_id` correspond à l’utilisateur connecté."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id_local, nom, points, surface, humidite, croissance, qualite_sol,
+                   statut_occupation, statut_location, lieu, culture,
+                   proprietaire_nom, proprietaire_tel, photos_urls
+            FROM parcelles
+            WHERE owner_user_id = $1
+            ORDER BY updated_at DESC
+            """,
+            owner_id,
+        )
+        return [dict(r) for r in rows]
+
+
 async def upsert_parcelle_row(
     row: dict[str, Any],
     owner_user_id: Optional[UUID] = None,
