@@ -1,0 +1,59 @@
+from fastapi import FastAPI
+from backend.services.weather_service import get_coordinates, get_weather
+from backend.services.weather_reco import generate_recommendations
+from fastapi.middleware.cors import CORSMiddleware
+from backend.services.chatbot_service import detect_intent
+from pydantic import BaseModel
+
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def root():
+    return {"message": "AgroConnect backend running"}
+
+@app.get("/api/weather/by-location")
+def weather_by_location(city: str, country: str):
+
+    coords = get_coordinates(city, country)
+
+    if not coords:
+        return {"error": "Localisation introuvable"}
+
+    weather = get_weather(coords["lat"], coords["lon"])
+    result = generate_recommendations(weather)
+
+    return {
+        "location": f"{city}, {country}",
+        "weather": weather,
+        "analysis": result["analysis"],
+        "recommendations": result["recommendations"],
+        "risk_level": result["risk_level"]
+    }
+
+
+class ChatRequest(BaseModel):
+    question: str
+@app.post("/api/chat/intention")
+def chat_intention(request: ChatRequest):
+    intent = detect_intent(request.question)
+
+    responses = {
+        "weather_analysis": "Je vais analyser la météo agricole.",
+        "disease_detection": "Ouverture du module maladies.",
+        "map": "Accès à la carte des champs.",
+        "marketplace": "Ouverture du marketplace.",
+        "help": "Je peux vous guider dans l'application."
+    }
+
+    return {
+        "intent": intent,
+        "response": responses.get(intent, "Je n'ai pas compris.")
+    }

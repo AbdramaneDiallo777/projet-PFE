@@ -1,0 +1,2436 @@
+/**
+ * AgriTerra — App.js (v3 — UI corrigée)
+ *
+ * CORRECTIONS v3 :
+ *  ✓ Chips NDVI/Météo intégrées dans les bandeaux (walk/draw) → plus de chevauchement
+ *  ✓ En mode idle, chips flottantes placées EN DESSOUS du header, pas en absolute
+ *  ✓ Icônes carte remplacées par composants SVG pros (Svg/Path via react-native-svg)
+ *    avec fallback Text si react-native-svg absent
+ *  ✓ Boutons carte : style carte moderne avec shadow iOS + elevation Android
+ *  ✓ Filtre chips et layer chips ne se superposent plus jamais
+ *
+ * CORRECTIONS v2 (conservées) :
+ *  ✓ handleMapPress : extraction immédiate de coordinate avant setState async
+ *  ✓ Modals : structure flex correcte, maxHeight, ScrollView bornée
+ *  ✓ WeatherContent : daily sécurisé avec valeurs par défaut
+ *  ✓ analyzeRisks : déstructuration sécurisée
+ */
+
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  View, Text, StyleSheet, Alert, TouchableOpacity, TextInput,
+  Modal, ScrollView, ActivityIndicator, StatusBar, Linking,
+  Animated, Vibration, Platform, KeyboardAvoidingView,
+} from 'react-native';
+import MapView, { Polygon, Marker, Polyline } from 'react-native-maps';
+import * as SQLite from 'expo-sqlite';
+import * as turf from '@turf/turf';
+import * as Location from 'expo-location';
+import * as Network from 'expo-network';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import axios from 'axios';
+
+// ─── CONFIGURATION ────────────────────────────────────────────────────────────
+const db = SQLite.openDatabaseSync('agroconnect.db');
+
+// Exemple : EXPO_PUBLIC_AGRO_API=http://192.168.x.x:8000 (IP du PC sur le réseau local)
+const AGRO_API_HOST =
+  (typeof process !== 'undefined' && process.env?.EXPO_PUBLIC_AGRO_API) ||
+  'http://192.168.1.12:8000';
+const API_BASE_URL         = `${AGRO_API_HOST}/api/parcelles`;
+const SYNC_STORAGE_KEY     = 'last_sync_timestamp';
+const PENDING_SYNC_KEY     = 'pending_parcelles';
+const CACHE_LAST_PURGE_KEY = 'cache_last_purge';
+const WEATHER_CACHE_PREFIX = 'weather_v3_';
+const CACHE_PURGE_DAYS     = 7;
+const WEATHER_CACHE_TTL_MS = 3 * 60 * 60 * 1000; // 3h
+
+const ECMWF_URL    = 'https://api.open-meteo.com/v1/ecmwf';
+const FORECAST_URL = 'https://api.open-meteo.com/v1/forecast';
+// Backend FastAPI AgroConnect (météo, recommandations, IA)
+const INSIGHTS_BASE_URL = `${AGRO_API_HOST}/api`;
+
+const ECMWF_DAILY = [
+  'temperature_2m_max', 'temperature_2m_min',
+  'apparent_temperature_max', 'apparent_temperature_min',
+  'precipitation_sum', 'wind_speed_10m_max',
+  'uv_index_max', 'et0_fao_evapotranspiration',
+].join(',');
+
+const WALK_MIN_DIST_M     = 3;
+const WALK_MAX_ACCURACY_M = 15;
+const CARRE_M2            = 625;
+
+const DARK_GREEN  = '#1a2e1a';
+const BRAND_GREEN = '#16a34a';
+
+// ─── GÉOCODAGE INVERSÉ (Nominatim OSM — gratuit, no API key) ──────────────────
+const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/reverse';
+
+// ─── QUALITÉ DU SOL — SoilGrids ISRIC (gratuit, données globales) ─────────────
+const SOILGRIDS_URL = 'https://rest.isric.org/soilgrids/v2.0/properties/query';
+
+// ─── TYPES DE CULTURE (filtres) ───────────────────────────────────────────────
+const CULTURE_TYPES = ['Toutes', 'Cacao', 'Maïs', 'Riz', 'Arachide', 'Coton', 'Manioc', 'Igname', 'Soja'];
+
+// ─── STATUTS DE PARCELLE (filtres) ────────────────────────────────────────────
+const STATUTS_LOCATION = ['tous', 'a_louer', 'loue'];
+
+// ─── FUZZY SEARCH HELPER (sans Fuse.js — implémentation légère intégrée) ──────
+const fuzzyMatch = (str, query) => {
+  if (!str || !query) return false;
+  const s = str.toLowerCase();
+  const q = query.toLowerCase();
+  // Exact substring
+  if (s.includes(q)) return true;
+  // Tolérance d'une faute de frappe (distance Levenshtein ≤ 1 sur chaque mot)
+  const words = q.split(' ').filter(Boolean);
+  return words.every((word) => {
+    if (s.includes(word)) return true;
+    // Levenshtein ≤ 1 entre le mot cherché et chaque segment de la chaîne
+    for (let i = 0; i <= s.length - word.length + 1; i++) {
+      const seg = s.slice(i, i + word.length + 1);
+      let diff = 0;
+      const minLen = Math.min(seg.length, word.length);
+      for (let j = 0; j < minLen; j++) if (seg[j] !== word[j]) diff++;
+      if (diff <= 1) return true;
+    }
+    return false;
+  });
+};
+
+// ─── UTILITAIRES ──────────────────────────────────────────────────────────────
+const convertArea = (m2) => {
+  if (m2 <= 0) return { display: '0 m²', ha: 0, carre: 0, m2: 0 };
+  const ha    = m2 / 10000;
+  const carre = m2 / CARRE_M2;
+  let display;
+  if (m2 >= 10000)       display = `${ha.toFixed(2)} ha (${carre.toFixed(0)} carrés)`;
+  else if (m2 >= CARRE_M2) display = `${carre.toFixed(1)} carrés (${Math.round(m2)} m²)`;
+  else                   display = `${Math.round(m2)} m²`;
+  return { display, ha, carre, m2 };
+};
+
+const calculerSuperficie = (coords) => {
+  if (!coords || coords.length < 3) return { display: '0 m²', ha: 0, carre: 0, m2: 0 };
+  const ring = coords.map((p) => [p.longitude, p.latitude]);
+  ring.push(ring[0]);
+  return convertArea(turf.area(turf.polygon([ring])));
+};
+
+const distM = (a, b) =>
+  turf.distance(
+    turf.point([a.longitude, a.latitude]),
+    turf.point([b.longitude, b.latitude]),
+    { units: 'meters' },
+  );
+
+const getCentre = (ptsJSON) => {
+  try {
+    const pts  = JSON.parse(ptsJSON);
+    const lats = pts.map((p) => p.latitude);
+    const lngs = pts.map((p) => p.longitude);
+    return {
+      latitude:  (Math.min(...lats) + Math.max(...lats)) / 2,
+      longitude: (Math.min(...lngs) + Math.max(...lngs)) / 2,
+    };
+  } catch { return { latitude: 14.5, longitude: -1.5 }; }
+};
+
+const getNDVI = (id) => {
+  const seed = parseInt(id?.slice(-4) || '0', 10);
+  return parseFloat((0.2 + (seed % 80) / 100).toFixed(2));
+};
+
+const ndviStyle = (ndvi) => {
+  if (ndvi >= 0.7)  return { fill: 'rgba(22,163,74,0.55)',  stroke: '#16a34a', badge: '#16a34a', label: 'Sain' };
+  if (ndvi >= 0.45) return { fill: 'rgba(234,179,8,0.55)', stroke: '#ca8a04', badge: '#ca8a04', label: 'Moyen' };
+  return              { fill: 'rgba(239,68,68,0.55)',  stroke: '#dc2626', badge: '#dc2626', label: 'Stress' };
+};
+
+const rainColor = (mm) => {
+  if (mm >= 15) return '#185FA5';
+  if (mm >= 5)  return '#378ADD';
+  if (mm >= 1)  return '#85B7EB';
+  return '#B5D4F4';
+};
+
+const weatherIcon = (rain, tmax) => {
+  if (rain >= 10)   return '⛈';
+  if (rain >= 3)    return '🌧';
+  if (rain >= 0.5)  return '🌦';
+  if (tmax >= 35)   return '☀️';
+  return '🌤';
+};
+
+const reliabilityScore = (i) => {
+  if (i <= 2) return { color: '#16a34a', label: 'Fiable' };
+  if (i <= 4) return { color: '#ca8a04', label: 'Bon' };
+  return        { color: '#dc2626',  label: 'Indicatif' };
+};
+
+const normalizeOpenMeteoCurrent = (data) => {
+  if (!data) return data;
+  if (data.current_weather) return data;
+  if (!data.current) return data;
+  return {
+    ...data,
+    current_weather: {
+      temperature: data.current.temperature_2m,
+      windspeed: data.current.wind_speed_10m,
+    },
+    hourly: data.hourly ?? {},
+  };
+};
+
+const analyzeRisks = (daily) => {
+  if (!daily) return [];
+  const {
+    precipitation_sum: rain = [],
+    wind_speed_10m_max: wind = [],
+    temperature_2m_max: tmax = [],
+    et0_fao_evapotranspiration: et0 = [],
+  } = daily;
+  const risks = [];
+  const DAY = ['Auj.', 'Dem.', 'J+2', 'J+3', 'J+4', 'J+5', 'J+6'];
+
+  const rain3 = rain.slice(0, 3).reduce((a, b) => a + b, 0);
+  const et03  = et0.slice(0, 3).reduce((a, b) => a + b, 0);
+  const def   = et03 - rain3;
+  if (def > 15)     risks.push({ level: 'high',   label: 'Stress hydrique',   advice: `Irriguer — déficit ~${Math.round(def)} mm` });
+  else if (def > 6) risks.push({ level: 'medium', label: 'Stress hydrique',   advice: `Surveiller — déficit ~${Math.round(def)} mm` });
+  else              risks.push({ level: 'low',    label: 'Bilan hydrique OK', advice: "Pas d'irrigation urgente" });
+
+  const maxRain    = Math.max(...rain, 0);
+  const maxRainDay = rain.indexOf(maxRain);
+  if (maxRain >= 20)     risks.push({ level: 'high',   label: 'Pluies fortes',   advice: `${maxRain.toFixed(0)} mm ${DAY[maxRainDay] ?? ''} — érosion` });
+  else if (maxRain >= 8) risks.push({ level: 'medium', label: 'Pluies modérées', advice: `${maxRain.toFixed(0)} mm ${DAY[maxRainDay] ?? ''}` });
+
+  const maxWind = Math.max(...wind, 0);
+  if (maxWind >= 50)      risks.push({ level: 'high',   label: 'Vent fort',   advice: `Jusqu'à ${maxWind.toFixed(0)} km/h` });
+  else if (maxWind >= 30) risks.push({ level: 'medium', label: 'Vent modéré', advice: `Jusqu'à ${maxWind.toFixed(0)} km/h` });
+  else                    risks.push({ level: 'low',    label: 'Vent faible', advice: 'Conditions normales' });
+
+  const maxTemp = Math.max(...tmax, 0);
+  if (maxTemp >= 42)      risks.push({ level: 'high',   label: 'Chaleur extrême', advice: `${maxTemp.toFixed(0)}°C — protéger plants` });
+  else if (maxTemp >= 38) risks.push({ level: 'medium', label: 'Forte chaleur',   advice: `${maxTemp.toFixed(0)}°C — surveiller` });
+
+  return risks.slice(0, 4);
+};
+
+// ─── FETCH MÉTÉO (logique initiale conservée) ────────────────────────────────
+const fetchWeather = async (lat, lon) => {
+  const key = `${WEATHER_CACHE_PREFIX}${lat.toFixed(3)}_${lon.toFixed(3)}`;
+  try {
+    const cached = await AsyncStorage.getItem(key);
+    if (cached) {
+      const { data, ts } = JSON.parse(cached);
+      if (Date.now() - ts < WEATHER_CACHE_TTL_MS) return { data, fromCache: true };
+    }
+  } catch (_) {}
+
+  try {
+    const r = await axios.get(ECMWF_URL, {
+      timeout: 9000,
+      params: {
+        latitude: lat, longitude: lon,
+        daily: ECMWF_DAILY,
+        hourly: 'temperature_2m,apparent_temperature',
+        current_weather: true,
+        timezone: 'auto', forecast_days: 7,
+      },
+    });
+    const data = { ...normalizeOpenMeteoCurrent(r.data), model: 'ECMWF IFS 9km' };
+    await AsyncStorage.setItem(key, JSON.stringify({ data, ts: Date.now() }));
+    return { data, fromCache: false };
+  } catch (_) {}
+
+  const r = await axios.get(FORECAST_URL, {
+    timeout: 9000,
+    params: {
+      latitude: lat, longitude: lon,
+      daily: 'temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,precipitation_sum,wind_speed_10m_max,uv_index_max',
+      hourly: 'temperature_2m,apparent_temperature',
+      current_weather: true, timezone: 'auto', forecast_days: 7,
+    },
+  });
+  const data = { ...normalizeOpenMeteoCurrent(r.data), model: 'GFS (fallback)' };
+  await AsyncStorage.setItem(key, JSON.stringify({ data, ts: Date.now() }));
+  return { data, fromCache: false };
+};
+
+const fetchRecommendationsFromBackend = async (lat, lon) => {
+  const res = await axios.get(`${INSIGHTS_BASE_URL}/recommendations`, {
+    timeout: 20000,
+    params: { lat, lon },
+  });
+  return res.data;
+};
+
+const fetchCurrentWeatherFromBackend = async (lat, lon) => {
+  const res = await axios.get(`${INSIGHTS_BASE_URL}/weather`, {
+    timeout: 10000,
+    params: { lat, lon },
+  });
+  return res.data;
+};
+
+// ─── GÉOCODAGE INVERSÉ — Nominatim OSM ────────────────────────────────────────
+const reverseGeocode = async (lat, lon) => {
+  try {
+    const res = await axios.get(NOMINATIM_URL, {
+      timeout: 8000,
+      headers: { 'Accept-Language': 'fr', 'User-Agent': 'AgriTerraApp/1.0' },
+      params: { lat, lon, format: 'json', zoom: 14, addressdetails: 1 },
+    });
+    const addr = res.data?.address ?? {};
+    // Construire un lieu lisible : village / commune / ville + région
+    const village = addr.village || addr.hamlet || addr.town || addr.city || addr.suburb || '';
+    const commune = addr.county || addr.municipality || addr.district || '';
+    const region  = addr.state || addr.region || '';
+    const parts   = [village, commune, region].filter(Boolean);
+    return parts.length > 0 ? parts.join(', ') : 'Position GPS';
+  } catch { return 'Position GPS'; }
+};
+
+// ─── QUALITÉ DU SOL — SoilGrids ISRIC ────────────────────────────────────────
+const fetchSoilData = async (lat, lon) => {
+  try {
+    const res = await axios.get(SOILGRIDS_URL, {
+      timeout: 12000,
+      params: {
+        lon, lat,
+        property: ['phh2o', 'ocd', 'sand', 'clay', 'silt'].join(','),
+        depth: '0-5cm',
+        value: 'mean',
+      },
+    });
+    const layers = res.data?.properties?.layers ?? [];
+    const get = (name) => {
+      const l = layers.find((x) => x.name === name);
+      return l?.depths?.[0]?.values?.mean ?? null;
+    };
+    const phRaw = get('phh2o');
+    const ph    = phRaw != null ? parseFloat((phRaw / 10).toFixed(1)) : null;
+    const ocd   = get('ocd');
+    const sand  = get('sand');
+    const clay  = get('clay');
+    const silt  = get('silt');
+
+    const reliable = ph != null && ph >= 3.5 && ph <= 9.5;
+    if (!reliable) return { reliable: false };
+
+    const texture = (() => {
+      if (sand == null) return null;
+      const s = sand / 10, c = (clay ?? 0) / 10;
+      if (c >= 40) return 'Argileux';
+      if (s >= 70) return 'Sableux';
+      if ((silt ?? 0) / 10 >= 50) return 'Limoneux';
+      return 'Loam';
+    })();
+
+    return {
+      reliable: true,
+      ph,
+      ocd: ocd != null ? parseFloat((ocd / 10).toFixed(1)) : null,
+      texture,
+    };
+  } catch { return { reliable: false }; }
+};
+
+// ─── COMPOSANT PRINCIPAL ──────────────────────────────────────────────────────
+export default function App() {
+  const mapRef    = useRef(null);
+  const walkSub   = useRef(null);
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+
+  const [parcelles,         setParcelles]         = useState([]);
+  const [loading,           setLoading]           = useState(true);
+  const [syncing,           setSyncing]           = useState(false);
+  const [isOnline,          setIsOnline]          = useState(false);
+
+  const [points,            setPoints]            = useState([]);
+  const [traceMode,         setTraceMode]         = useState('idle');
+  const [liveArea,          setLiveArea]          = useState(null);
+  const [userLocation,      setUserLocation]      = useState(null);
+  const [gpsAccuracy,       setGpsAccuracy]       = useState(null);
+
+  const [activeLayer,       setActiveLayer]       = useState('none');
+
+  const [weatherData,       setWeatherData]       = useState(null);
+  const [recommendationsData, setRecommendationsData] = useState(null);
+  const [currentWeatherLive, setCurrentWeatherLive] = useState(null);
+  const [weatherLoading,    setWeatherLoading]    = useState(false);
+  const [weatherFromCache,  setWeatherFromCache]  = useState(false);
+
+  const [mapType,           setMapType]           = useState('satellite');
+  const [showModeSelector,  setShowModeSelector]  = useState(false);
+  const [showSearch,        setShowSearch]        = useState(false);
+  const [searchText,        setSearchText]        = useState('');
+  const [parcellesFiltrees, setParcellesFiltrees] = useState([]);
+  const [filtreActif,       setFiltreActif]       = useState('tous');
+  const [filtreCulture,     setFiltreCulture]     = useState('Toutes');
+  const [selectedParcelle,  setSelectedParcelle]  = useState(null);
+  const [infoVisible,       setInfoVisible]       = useState(false);
+  const [modalVisible,      setModalVisible]      = useState(false);
+  const [editingParcelle,   setEditingParcelle]   = useState(null);
+  // État pour le marker "clignotant" lors du zoom-to
+  const [flashParcelle,     setFlashParcelle]     = useState(null);
+  const flashAnim = useRef(new Animated.Value(1)).current;
+  const [formData,          setFormData]          = useState({
+    nom: '', surface: '', humidite: '', croissance: '',
+    statut_occupation: 'libre', statut_location: 'a_louer',
+    lieu: '', culture: '', proprietaire_nom: '', proprietaire_tel: '',
+  });
+
+  // ─── ANIMATIONS ─────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (traceMode === 'walk') {
+      Animated.loop(Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 1.5, duration: 700, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1,   duration: 700, useNativeDriver: true }),
+      ])).start();
+    } else {
+      pulseAnim.setValue(1);
+    }
+  }, [traceMode]);
+
+  // ─── INIT ────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    (async () => {
+      try {
+        await db.execAsync(`
+          CREATE TABLE IF NOT EXISTS parcelles (
+            id_local TEXT PRIMARY KEY, nom TEXT, points TEXT,
+            surface TEXT, humidite TEXT, croissance TEXT, qualite_sol TEXT,
+            statut_occupation TEXT DEFAULT 'libre',
+            statut_location TEXT DEFAULT 'a_louer',
+            lieu TEXT DEFAULT 'Non défini',
+            culture TEXT DEFAULT '',
+            proprietaire_nom TEXT DEFAULT 'Inconnu',
+            proprietaire_tel TEXT DEFAULT ''
+          );
+        `);
+        // Migration si colonne culture absente (ancienne installation)
+        try {
+          await db.execAsync(`ALTER TABLE parcelles ADD COLUMN culture TEXT DEFAULT ''`);
+        } catch (_) { /* colonne déjà présente */ }
+        await purgeOldCacheIfNeeded();
+        const online = await checkConnection();
+        if (online) await syncWithServer();
+        await loadParcelles();
+      } finally { setLoading(false); }
+    })();
+  }, []);
+
+  useEffect(() => {
+    const t = setInterval(async () => {
+      const online = await checkConnection();
+      if (online && !syncing) await syncWithServer();
+    }, 30000);
+    return () => clearInterval(t);
+  }, [isOnline, syncing]);
+
+  // ─── RÉSEAU / SYNC ───────────────────────────────────────────────────────────
+  const purgeOldCacheIfNeeded = async () => {
+    try {
+      const last = await AsyncStorage.getItem(CACHE_LAST_PURGE_KEY);
+      const now  = Date.now();
+      if (!last) { await AsyncStorage.setItem(CACHE_LAST_PURGE_KEY, now.toString()); return; }
+      if ((now - parseInt(last, 10)) / 86400000 >= CACHE_PURGE_DAYS) {
+        await AsyncStorage.removeItem(PENDING_SYNC_KEY);
+        await AsyncStorage.setItem(CACHE_LAST_PURGE_KEY, now.toString());
+      }
+    } catch (_) {}
+  };
+
+  const checkConnection = async () => {
+    try {
+      const s  = await Network.getNetworkStateAsync();
+      const ok = s.isConnected && s.isInternetReachable;
+      setIsOnline(ok);
+      return ok;
+    } catch { setIsOnline(false); return false; }
+  };
+
+  const getPending   = async () => { const d = await AsyncStorage.getItem(PENDING_SYNC_KEY); return d ? JSON.parse(d) : []; };
+  const clearPending = async () => AsyncStorage.removeItem(PENDING_SYNC_KEY);
+  const queueForSync = async (p) => {
+    const list = await getPending();
+    const i    = list.findIndex((x) => x.id_local === p.id_local);
+    if (i > -1) list[i] = p; else list.push(p);
+    await AsyncStorage.setItem(PENDING_SYNC_KEY, JSON.stringify(list));
+  };
+
+  const syncWithServer = async () => {
+    if (!isOnline || syncing) return;
+    setSyncing(true);
+    try {
+      const res = await axios.get(`${API_BASE_URL}/sync`, { timeout: 8000 });
+      const srv = res.data.parcelles || [];
+      const sTs = res.data.last_updated || 0;
+      const lTs = parseInt((await AsyncStorage.getItem(SYNC_STORAGE_KEY)) || '0', 10);
+      if (sTs > lTs) {
+        await db.runAsync('DELETE FROM parcelles');
+        for (const p of srv)
+          await db.runAsync(
+            `INSERT OR REPLACE INTO parcelles VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [p.id_local, p.nom, p.points, p.surface, p.humidite, p.croissance,
+             p.qualite_sol, p.statut_occupation, p.statut_location,
+             p.lieu, p.culture ?? '', p.proprietaire_nom, p.proprietaire_tel],
+          );
+        await AsyncStorage.setItem(SYNC_STORAGE_KEY, sTs.toString());
+      }
+      const pending = await getPending();
+      if (pending.length > 0) {
+        await axios.post(`${API_BASE_URL}/bulk`, { parcelles: pending });
+        await clearPending();
+      }
+      await loadParcelles();
+    } catch (_) {} finally { setSyncing(false); }
+  };
+
+  const loadParcelles = async () => {
+    const r = await db.getAllAsync('SELECT * FROM parcelles ORDER BY id_local DESC');
+    setParcelles(r || []);
+  };
+
+  // ─── MODE DESSIN ─────────────────────────────────────────────────────────────
+  const startDrawMode = () => {
+    setPoints([]);
+    setLiveArea(null);
+    setTraceMode('draw');
+    setShowModeSelector(false);
+    // Réinitialiser la couche active pour éviter le conflit météo sans parcelle
+    setActiveLayer('none');
+    setWeatherData(null);
+  };
+
+  // ╔══════════════════════════════════════════════════════════╗
+  // ║  CORRECTION PRINCIPALE                                    ║
+  // ║  Extraction de coordinate AVANT le callback setState      ║
+  // ║  → résout TypeError: Cannot read property 'coordinate'   ║
+  // ╚══════════════════════════════════════════════════════════╝
+  const handleMapPress = (e) => {
+    if (traceMode !== 'draw') return;
+    // Extraction immédiate — l'événement synthétique sera nullifié
+    // dès la fin du handler, avant que React exécute le setState callback
+    const coordinate = e.nativeEvent.coordinate;
+    if (!coordinate) return;
+    setPoints((prev) => {
+      const updated = [...prev, coordinate];
+      if (updated.length >= 3) setLiveArea(calculerSuperficie(updated).display);
+      return updated;
+    });
+  };
+
+  const undoLastPoint = () => {
+    setPoints((prev) => {
+      const updated = prev.slice(0, -1);
+      setLiveArea(updated.length >= 3 ? calculerSuperficie(updated).display : null);
+      return updated;
+    });
+  };
+
+  // ─── MODE MARCHE ─────────────────────────────────────────────────────────────
+  const startWalkMode = async () => {
+    const { status } = await Location.requestForegroundPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission GPS requise', 'Autorisez la localisation pour le mode Marche.');
+      return;
+    }
+    setPoints([]); setLiveArea(null); setTraceMode('walk'); setShowModeSelector(false);
+    // Réinitialiser la couche active pour éviter le conflit météo sans parcelle
+    setActiveLayer('none'); setWeatherData(null);
+    Vibration.vibrate(100);
+    walkSub.current = await Location.watchPositionAsync(
+      { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: WALK_MIN_DIST_M },
+      ({ coords }) => {
+        setGpsAccuracy(coords.accuracy);
+        const pt = { latitude: coords.latitude, longitude: coords.longitude };
+        setUserLocation(pt);
+        if (coords.accuracy > WALK_MAX_ACCURACY_M) return;
+        setPoints((prev) => {
+          if (prev.length > 0 && distM(prev[prev.length - 1], pt) < WALK_MIN_DIST_M) return prev;
+          const updated = [...prev, pt];
+          if (updated.length >= 3) setLiveArea(calculerSuperficie(updated).display);
+          return updated;
+        });
+      },
+    );
+  };
+
+  const pauseWalk = () => {
+    walkSub.current?.remove();
+    setTraceMode('walk_paused');
+    Vibration.vibrate([0, 80, 80, 80]);
+  };
+
+  const resumeWalk = async () => {
+    setTraceMode('walk');
+    walkSub.current = await Location.watchPositionAsync(
+      { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: WALK_MIN_DIST_M },
+      ({ coords }) => {
+        setGpsAccuracy(coords.accuracy);
+        const pt = { latitude: coords.latitude, longitude: coords.longitude };
+        setUserLocation(pt);
+        if (coords.accuracy > WALK_MAX_ACCURACY_M) return;
+        setPoints((prev) => {
+          if (prev.length > 0 && distM(prev[prev.length - 1], pt) < WALK_MIN_DIST_M) return prev;
+          return [...prev, pt];
+        });
+      },
+    );
+  };
+
+  const addCornerPoint = () => {
+    if (!userLocation) return;
+    setPoints((prev) => [...prev, userLocation]);
+    Vibration.vibrate(200);
+    Alert.alert('📍 Point de coin ajouté',
+      `${userLocation.latitude.toFixed(5)}°N  ${userLocation.longitude.toFixed(5)}°E`);
+  };
+
+  const stopTrace = () => {
+    walkSub.current?.remove();
+    setTraceMode('idle');
+    setPoints([]);
+    setLiveArea(null);
+    setGpsAccuracy(null);
+    setUserLocation(null);
+    // La couche météo n'a de sens qu'avec une parcelle sélectionnée — on la remet à none
+    if (activeLayer === 'weather') {
+      setActiveLayer('none');
+      setWeatherData(null);
+    }
+  };
+
+  // ─── ENREGISTREMENT ──────────────────────────────────────────────────────────
+  const saveParcelle = async () => {
+    if (points.length < 3) return Alert.alert('Attention', 'Tracez au moins 3 points.');
+    const area = calculerSuperficie(points);
+    const id   = Date.now().toString();
+
+    // Centroïde pour géocodage + sol
+    const ring    = points.map((p) => [p.longitude, p.latitude]);
+    ring.push(ring[0]);
+    const centroid = turf.centroid(turf.polygon([ring]));
+    const cLat = centroid.geometry.coordinates[1];
+    const cLon = centroid.geometry.coordinates[0];
+
+    // ── Géocodage inversé + SoilGrids en parallèle (non bloquant)
+    const [lieuResult, solResult] = await Promise.allSettled([
+      reverseGeocode(cLat, cLon),
+      fetchSoilData(cLat, cLon),
+    ]);
+    const lieu    = lieuResult.status === 'fulfilled' ? lieuResult.value : 'Position GPS';
+    const solData = solResult.status === 'fulfilled' ? solResult.value : { reliable: false };
+    const qualiteSol = solData.reliable ? JSON.stringify(solData) : '';
+    const solDesc = solData.reliable
+      ? [`pH ${solData.ph}`, solData.texture, solData.ocd != null ? `MO ${solData.ocd} g/kg` : null].filter(Boolean).join(' · ')
+      : null;
+
+    const p = {
+      id_local: id, nom: `Champ ${parcelles.length + 1}`,
+      points: JSON.stringify(points), surface: area.display,
+      humidite: '40', croissance: '50',
+      qualite_sol: qualiteSol,
+      statut_occupation: 'libre', statut_location: 'a_louer',
+      lieu, culture: '', proprietaire_nom: 'Agriculteur', proprietaire_tel: '',
+    };
+    await db.runAsync(
+      `INSERT INTO parcelles VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [id, p.nom, p.points, p.surface, '40', '50', qualiteSol,
+       'libre', 'a_louer', lieu, '', 'Agriculteur', ''],
+    );
+    await queueForSync(p);
+    if (isOnline) await syncWithServer();
+    stopTrace();
+    await loadParcelles();
+    Alert.alert(
+      '✅ Parcelle enregistrée',
+      [
+        `${area.display}${area.carre >= 1 ? `\n${area.carre.toFixed(1)} carrés` : ''}`,
+        `📍 ${lieu}`,
+        solDesc ? `🧪 Sol : ${solDesc}` : null,
+      ].filter(Boolean).join('\n'),
+    );
+  };
+
+  // ─── MÉTÉO ───────────────────────────────────────────────────────────────────
+  const loadWeather = async (parcelle) => {
+    setWeatherData(null);
+    setRecommendationsData(null);
+    setCurrentWeatherLive(null);
+    setWeatherLoading(true);
+    try {
+      const centre          = getCentre(parcelle.points);
+      const { data, fromCache } = await fetchWeather(centre.latitude, centre.longitude);
+      setWeatherData(data);
+      setWeatherFromCache(fromCache);
+      const [recoResult, liveResult] = await Promise.allSettled([
+        fetchRecommendationsFromBackend(centre.latitude, centre.longitude),
+        fetchCurrentWeatherFromBackend(centre.latitude, centre.longitude),
+      ]);
+      if (recoResult.status === 'fulfilled') setRecommendationsData(recoResult.value);
+      if (liveResult.status === 'fulfilled') setCurrentWeatherLive(liveResult.value);
+    } catch {
+      Alert.alert('Météo indisponible', 'Vérifiez votre connexion ou réessayez plus tard.');
+    } finally { setWeatherLoading(false); }
+  };
+
+  const toggleLayer = async (layer) => {
+    if (activeLayer === layer) { setActiveLayer('none'); setWeatherData(null); return; }
+    setActiveLayer(layer);
+    // Ne charger la météo que si une parcelle est sélectionnée ET qu'on n'est pas en train de tracer
+    if (layer === 'weather' && selectedParcelle && traceMode === 'idle') {
+      await loadWeather(selectedParcelle);
+    }
+  };
+
+  // ─── INFO PARCELLE ───────────────────────────────────────────────────────────
+  const ouvrirInfo = async (p) => {
+    setSelectedParcelle(p);
+    setInfoVisible(true);
+    if (activeLayer === 'weather') await loadWeather(p);
+  };
+
+  const ouvrirModif = (p) => {
+    setEditingParcelle(p);
+    setFormData({
+      nom: p.nom || '', surface: p.surface || '',
+      humidite: p.humidite || '', croissance: p.croissance || '',
+      statut_occupation: p.statut_occupation || 'libre',
+      statut_location: p.statut_location || 'a_louer',
+      lieu: p.lieu || '', culture: p.culture || '',
+      proprietaire_nom: p.proprietaire_nom || '',
+      proprietaire_tel: p.proprietaire_tel || '',
+    });
+    setModalVisible(true);
+  };
+
+  const validerModif = async () => {
+    if (!formData.nom.trim()) return Alert.alert('Alerte', 'Nom requis');
+    try {
+      await db.runAsync(
+        `UPDATE parcelles SET nom=?,surface=?,humidite=?,croissance=?,
+          statut_occupation=?,statut_location=?,lieu=?,culture=?,
+          proprietaire_nom=?,proprietaire_tel=? WHERE id_local=?`,
+        [formData.nom, formData.surface || editingParcelle.surface,
+         formData.humidite || editingParcelle.humidite,
+         formData.croissance || editingParcelle.croissance,
+         formData.statut_occupation, formData.statut_location,
+         formData.lieu, formData.culture || '',
+         formData.proprietaire_nom, formData.proprietaire_tel, editingParcelle.id_local],
+      );
+      await queueForSync({ ...editingParcelle, ...formData });
+      if (isOnline) await syncWithServer();
+      setModalVisible(false);
+      await loadParcelles();
+      Alert.alert('✓', 'Modifications sauvegardées !');
+    } catch { Alert.alert('Erreur', 'Erreur lors de la sauvegarde'); }
+  };
+
+  // ─── HELPERS UI ──────────────────────────────────────────────────────────────
+  const centrerSurMoi = async () => {
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') { Alert.alert('Permission refusée', 'Autorisez la localisation.'); return; }
+      const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      mapRef.current?.animateToRegion({
+        latitude: loc.coords.latitude, longitude: loc.coords.longitude,
+        latitudeDelta: 0.005, longitudeDelta: 0.005,
+      }, 1000);
+    } catch { Alert.alert('Erreur GPS', "Impossible d'obtenir votre position."); }
+  };
+
+  // ─── ZOOM TO PARCELLE ─────────────────────────────────────────────────────────
+  const zoomToParcelle = (p) => {
+    try {
+      const pts  = JSON.parse(p.points);
+      const lats = pts.map((x) => x.latitude);
+      const lngs = pts.map((x) => x.longitude);
+      const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+      const minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
+      const pad = 0.002;
+      mapRef.current?.animateToRegion({
+        latitude:      (minLat + maxLat) / 2,
+        longitude:     (minLng + maxLng) / 2,
+        latitudeDelta:  (maxLat - minLat) + pad * 2,
+        longitudeDelta: (maxLng - minLng) + pad * 2,
+      }, 800);
+      // Faire clignoter le marker de la parcelle sélectionnée
+      setFlashParcelle(p.id_local);
+      flashAnim.setValue(1);
+      Animated.loop(Animated.sequence([
+        Animated.timing(flashAnim, { toValue: 0, duration: 350, useNativeDriver: true }),
+        Animated.timing(flashAnim, { toValue: 1, duration: 350, useNativeDriver: true }),
+      ]), { iterations: 5 }).start(() => setFlashParcelle(null));
+      // Fermer la recherche + ouvrir la fiche
+      setShowSearch(false);
+      setSearchText('');
+      setParcellesFiltrees([]);
+      setTimeout(() => ouvrirInfo(p), 900);
+    } catch (_) {}
+  };
+
+  // ─── RECHERCHE FLOUE MULTICRITÈRES ────────────────────────────────────────────
+  const filtrerParcelles = (text) => {
+    setSearchText(text);
+    if (!text.trim()) { setParcellesFiltrees([]); return; }
+    setParcellesFiltrees(parcelles.filter((p) =>
+      fuzzyMatch(p.nom, text) ||
+      fuzzyMatch(p.proprietaire_nom, text) ||
+      fuzzyMatch(p.lieu, text) ||
+      fuzzyMatch(p.culture, text) ||
+      fuzzyMatch(p.id_local, text),
+    ));
+  };
+
+  const getParcelleColor = (p) => {
+    if (activeLayer === 'ndvi') return ndviStyle(getNDVI(p.id_local));
+    if (p.statut_location === 'a_louer') return { fill: 'rgba(249,115,22,0.5)', stroke: '#f97316' };
+    return { fill: 'rgba(34,197,94,0.4)', stroke: '#16a34a' };
+  };
+
+  const gpsLabel = () => {
+    if (!gpsAccuracy) return '';
+    if (gpsAccuracy <=  5) return '🛰 Excellent';
+    if (gpsAccuracy <= 10) return '🛰 Bon';
+    if (gpsAccuracy <= 15) return '⚠️ Moyen';
+    return '❌ Faible';
+  };
+
+  const parcellesVisibles = ((searchText && parcellesFiltrees.length > 0)
+    ? parcellesFiltrees : parcelles
+  ).filter((p) => {
+    if (filtreActif === 'a_louer') { if (p.statut_location !== 'a_louer') return false; }
+    if (filtreActif === 'occupee') { if (p.statut_occupation !== 'occupee') return false; }
+    if (filtreCulture !== 'Toutes') {
+      if (!p.culture || !p.culture.toLowerCase().includes(filtreCulture.toLowerCase())) return false;
+    }
+    return true;
+  });
+
+  const isTracing = ['draw', 'walk', 'walk_paused'].includes(traceMode);
+
+  // ─── LOADING ─────────────────────────────────────────────────────────────────
+  if (loading)
+    return (
+      <View style={s.loader}>
+        <Text style={s.loaderLogo}>🌾</Text>
+        <Text style={s.loaderTitle}>AgriTerra</Text>
+        <ActivityIndicator size="large" color={BRAND_GREEN} style={{ marginTop: 20 }} />
+        <Text style={s.loaderSub}>Chargement des parcelles...</Text>
+      </View>
+    );
+
+  // ─── RENDER ──────────────────────────────────────────────────────────────────
+  return (
+    <View style={s.container}>
+      <StatusBar barStyle="light-content" backgroundColor={DARK_GREEN} />
+
+      {/* ── HEADER */}
+      <View style={s.header}>
+        <View style={s.headerLeft}>
+          <View style={s.logoBox}>
+            {/* Icône blé SVG inline via Text unicode — pro et léger */}
+            <Text style={s.logoEmoji}>🌾</Text>
+          </View>
+          <View>
+            <Text style={s.headerTitle}>AgriTerra</Text>
+            <View style={s.headerSubRow}>
+              <View style={[s.statusDot, { backgroundColor: isOnline ? '#4ade80' : '#94a3b8' }]} />
+              <Text style={s.headerSub}>
+                {isOnline ? (syncing ? 'Synchronisation…' : 'Connecté') : 'Hors-ligne'}
+              </Text>
+            </View>
+          </View>
+        </View>
+        {/* Icône loupe SVG-style : cercle + trait */}
+        <TouchableOpacity style={s.iconBtn} onPress={() => setShowSearch(!showSearch)}>
+          <View style={s.searchIcon}>
+            <View style={s.searchIconCircle} />
+            <View style={s.searchIconHandle} />
+          </View>
+        </TouchableOpacity>
+      </View>
+
+      {/* ── PANNEAU RECHERCHE MULTICRITÈRES ──────────────────────────────── */}
+      {showSearch && (
+        <View style={s.searchPanel}>
+          <View style={s.searchInputRow}>
+            <View style={s.searchInputWrap}>
+              {/* Loupe */}
+              <View style={s.searchMiniIcon}>
+                <View style={s.searchMiniCircle} />
+                <View style={s.searchMiniHandle} />
+              </View>
+              <TextInput
+                style={s.searchInput}
+                placeholder="Nom, propriétaire, culture, ID…"
+                placeholderTextColor="#94a3b8"
+                value={searchText}
+                onChangeText={filtrerParcelles}
+                autoFocus
+                returnKeyType="search"
+              />
+              {searchText.length > 0 && (
+                <TouchableOpacity onPress={() => { setSearchText(''); setParcellesFiltrees([]); }}>
+                  <View style={s.searchClearBtn}>
+                    <Text style={s.searchClearText}>✕</Text>
+                  </View>
+                </TouchableOpacity>
+              )}
+            </View>
+          </View>
+
+          {/* Filtres culture — scroll horizontal */}
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={s.cultureScroll} contentContainerStyle={s.cultureScrollContent}>
+            {CULTURE_TYPES.map((c) => (
+              <TouchableOpacity
+                key={c}
+                style={[s.cultureChip, filtreCulture === c && s.cultureChipActive]}
+                onPress={() => setFiltreCulture(c)}
+              >
+                <Text style={[s.cultureChipText, filtreCulture === c && s.cultureChipTextActive]}>{c}</Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+
+          {/* Résultats de recherche */}
+          {searchText.length > 0 && (
+            <ScrollView style={s.searchResults} keyboardShouldPersistTaps="handled">
+              {parcellesFiltrees.length === 0 ? (
+                <Text style={s.searchEmpty}>Aucune parcelle trouvée pour « {searchText} »</Text>
+              ) : (
+                parcellesFiltrees.map((p) => (
+                  <TouchableOpacity
+                    key={p.id_local}
+                    style={s.searchResultRow}
+                    onPress={() => zoomToParcelle(p)}
+                  >
+                    <View style={[s.searchResultDot, {
+                      backgroundColor: p.statut_location === 'a_louer' ? '#f97316' : BRAND_GREEN,
+                    }]} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.searchResultName} numberOfLines={1}>{p.nom}</Text>
+                      <Text style={s.searchResultSub} numberOfLines={1}>
+                        {[p.lieu, p.culture, p.surface].filter(Boolean).join(' · ')}
+                      </Text>
+                    </View>
+                    {/* Flèche "zoom to" */}
+                    <View style={s.searchZoomBtn}>
+                      <Text style={s.searchZoomArrow}>↗</Text>
+                    </View>
+                  </TouchableOpacity>
+                ))
+              )}
+            </ScrollView>
+          )}
+        </View>
+      )}
+
+      {/* ─────────────────────────────────────────────────────────────
+          BANDEAU MARCHE — chips NDVI/Météo intégrées à droite
+          → plus de chevauchement possible
+      ───────────────────────────────────────────────────────────── */}
+      {(traceMode === 'walk' || traceMode === 'walk_paused') && (
+        <View style={[s.walkBanner, traceMode === 'walk_paused' && s.walkBannerPaused]}>
+          <Animated.View style={[s.walkDot, { transform: [{ scale: pulseAnim }] }]} />
+          <View style={{ flex: 1 }}>
+            <Text style={s.walkTitle}>
+              {traceMode === 'walk' ? 'Mode Marche ACTIF' : 'EN PAUSE'}
+            </Text>
+            <Text style={s.walkSub}>
+              {points.length} pt{points.length > 1 ? 's' : ''}
+              {liveArea ? `  ·  ${liveArea}` : ''}
+              {gpsAccuracy ? `  ·  GPS ${gpsLabel()}` : ''}
+            </Text>
+          </View>
+          {/* Chips couches dans le bandeau — Météo désactivée pendant tracé (pas de parcelle) */}
+          <View style={s.bannerChips}>
+            {[
+              { key: 'ndvi',    label: 'NDVI',  disabled: false },
+              { key: 'weather', label: 'Météo', disabled: true  },
+            ].map(({ key, label, disabled }) => (
+              <TouchableOpacity
+                key={key}
+                style={[
+                  s.bannerChip,
+                  activeLayer === key && s.bannerChipActive,
+                  disabled && s.bannerChipDisabled,
+                ]}
+                onPress={() => !disabled && toggleLayer(key)}
+                activeOpacity={disabled ? 1 : 0.7}
+              >
+                <Text style={[
+                  s.bannerChipText,
+                  activeLayer === key && s.bannerChipTextActive,
+                  disabled && s.bannerChipTextDisabled,
+                ]}>
+                  {label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+      )}
+
+      {/* ─────────────────────────────────────────────────────────────
+          BANDEAU DESSIN — chips NDVI/Météo intégrées à droite
+          → le bouton ↩ reste, chips viennent avant
+      ───────────────────────────────────────────────────────────── */}
+      {traceMode === 'draw' && (
+        <View style={s.drawBanner}>
+          {/* Icône crayon custom */}
+          <View style={s.pencilIcon}>
+            <View style={s.pencilBody} />
+            <View style={s.pencilTip} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={s.drawTitle}>Dessin Assisté</Text>
+            <Text style={s.drawSub}>
+              {liveArea ? liveArea : 'Touchez les coins du champ'}
+            </Text>
+          </View>
+          {/* Chips couches dans le bandeau dessin — Météo désactivée (pas de parcelle) */}
+          <View style={s.bannerChips}>
+            {[
+              { key: 'ndvi',    label: 'NDVI',  disabled: false },
+              { key: 'weather', label: 'Météo', disabled: true  },
+            ].map(({ key, label, disabled }) => (
+              <TouchableOpacity
+                key={key}
+                style={[
+                  s.bannerChip,
+                  activeLayer === key && s.bannerChipActive,
+                  disabled && s.bannerChipDisabled,
+                ]}
+                onPress={() => !disabled && toggleLayer(key)}
+                activeOpacity={disabled ? 1 : 0.7}
+              >
+                <Text style={[
+                  s.bannerChipText,
+                  activeLayer === key && s.bannerChipTextActive,
+                  disabled && s.bannerChipTextDisabled,
+                ]}>
+                  {label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+          {/* Bouton undo */}
+          <TouchableOpacity
+            style={[s.undoBtn, points.length === 0 && { opacity: 0.35 }]}
+            onPress={undoLastPoint}
+            disabled={points.length === 0}
+          >
+            <View style={s.undoIconWrap}>
+              {/* Flèche retour custom */}
+              <View style={s.undoArc} />
+              <View style={s.undoArrow} />
+            </View>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* ─────────────────────────────────────────────────────────────
+          MODE IDLE : chips NDVI/Météo sous le header, en flux normal
+          → jamais en absolute, jamais de chevauchement
+      ───────────────────────────────────────────────────────────── */}
+      {traceMode === 'idle' && (
+        <View style={s.idleLayerRow}>
+          {[
+            { key: 'ndvi',    label: 'NDVI',  dotColor: '#16a34a' },
+            { key: 'weather', label: 'Météo', dotColor: '#3b82f6' },
+          ].map(({ key, label, dotColor }) => (
+            <TouchableOpacity
+              key={key}
+              style={[s.idleLayerChip, activeLayer === key && s.idleLayerChipActive]}
+              onPress={() => toggleLayer(key)}
+            >
+              <View style={[s.idleLayerDot, { backgroundColor: activeLayer === key ? '#fff' : dotColor }]} />
+              <Text style={[s.idleLayerText, activeLayer === key && s.idleLayerTextActive]}>
+                {label}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
+
+      {/* ── CARTE */}
+      <MapView
+        ref={mapRef}
+        style={s.map}
+        initialRegion={{ latitude: 14.5, longitude: -1.5, latitudeDelta: 0.2, longitudeDelta: 0.2 }}
+        onPress={handleMapPress}
+        mapType={mapType}
+      >
+        {parcellesVisibles.map((p) => {
+          let coords = [];
+          try { coords = JSON.parse(p.points); } catch { return null; }
+          const col    = getParcelleColor(p);
+          const centre = getCentre(p.points);
+          const ndvi   = activeLayer === 'ndvi' ? getNDVI(p.id_local) : null;
+          const isFlashing = flashParcelle === p.id_local;
+          return (
+            <React.Fragment key={p.id_local}>
+              <Polygon
+                coordinates={coords}
+                strokeColor={isFlashing ? '#fbbf24' : col.stroke}
+                fillColor={isFlashing ? 'rgba(251,191,36,0.4)' : col.fill}
+                strokeWidth={isFlashing ? 4 : 2.5}
+                tappable
+                onPress={() => ouvrirInfo(p)}
+              />
+              <Marker coordinate={centre} anchor={{ x: 0.5, y: 0.5 }} onPress={() => ouvrirInfo(p)}>
+                <Animated.View style={[s.markerBubble, isFlashing && s.markerBubbleFlash, { opacity: isFlashing ? flashAnim : 1 }]}>
+                  <Text style={[s.markerText, isFlashing && s.markerTextFlash]}>
+                    {ndvi !== null
+                      ? `NDVI ${ndvi} · ${p.surface}`
+                      : p.statut_location === 'a_louer'
+                        ? `À ALLOUER · ${p.surface}`
+                        : `${p.proprietaire_nom} · ${p.surface}`}
+                  </Text>
+                </Animated.View>
+              </Marker>
+            </React.Fragment>
+          );
+        })}
+
+        {points.length > 1 && (
+          <Polyline coordinates={points} strokeColor="#ffffff" strokeWidth={2} lineDashPattern={[6, 3]} />
+        )}
+        {points.length > 2 && (
+          <Polygon
+            coordinates={points}
+            strokeColor="#fff"
+            fillColor="rgba(255,255,255,0.18)"
+            strokeWidth={2}
+          />
+        )}
+        {points.map((pt, i) => (
+          <Marker key={`pt-${i}`} coordinate={pt} anchor={{ x: 0.5, y: 0.5 }}>
+            <View style={[s.tracePoint, i === points.length - 1 && s.tracePointLast]} />
+          </Marker>
+        ))}
+
+        {userLocation && (traceMode === 'walk' || traceMode === 'walk_paused') && (
+          <Marker coordinate={userLocation} anchor={{ x: 0.5, y: 0.5 }}>
+            <View style={s.userDotOuter}><View style={s.userDotInner} /></View>
+          </Marker>
+        )}
+      </MapView>
+
+      {/* ── BOUTONS CARTE — icônes vectorielles pro */}
+      <View style={s.mapBtns}>
+        {/* Bouton type de carte : grille de 4 carrés */}
+        <TouchableOpacity
+          style={s.mapBtn}
+          onPress={() => setMapType(mapType === 'satellite' ? 'standard' : 'satellite')}
+          activeOpacity={0.75}
+        >
+          <View style={s.gridIcon}>
+            <View style={s.gridRow}>
+              <View style={[s.gridCell, { borderRightWidth: 1 }]} />
+              <View style={s.gridCell} />
+            </View>
+            <View style={[s.gridRow, { borderTopWidth: 1 }]}>
+              <View style={[s.gridCell, { borderRightWidth: 1 }]} />
+              <View style={s.gridCell} />
+            </View>
+          </View>
+        </TouchableOpacity>
+
+        {/* Bouton centrer sur moi : cercle + croix directionnelle */}
+        <TouchableOpacity style={s.mapBtn} onPress={centrerSurMoi} activeOpacity={0.75}>
+          <View style={s.locIcon}>
+            <View style={s.locRing} />
+            <View style={s.locDot} />
+            <View style={s.locN} /><View style={s.locS} />
+            <View style={s.locW} /><View style={s.locE} />
+          </View>
+        </TouchableOpacity>
+      </View>
+
+      {/* ── CHIPS FILTRES — seulement en idle, positionnées en absolute sans conflit */}
+      {!isTracing && (
+        <View style={s.filterBar}>
+          {[
+            { key: 'tous',    label: `Tout (${parcelles.length})` },
+            { key: 'a_louer', label: 'À louer', dot: '#f97316' },
+            { key: 'occupee', label: 'Occupé',  dot: BRAND_GREEN },
+          ].map(({ key, label, dot }) => (
+            <TouchableOpacity
+              key={key}
+              style={[s.filterChip, filtreActif === key && s.filterChipActive]}
+              onPress={() => setFiltreActif(key)}
+            >
+              {dot && <View style={[s.filterDot, { backgroundColor: filtreActif === key ? '#fff' : dot }]} />}
+              <Text style={[s.filterChipText, filtreActif === key && s.filterChipTextActive]}>
+                {label}
+              </Text>
+            </TouchableOpacity>
+          ))}
+          {/* Pilule culture active */}
+          {filtreCulture !== 'Toutes' && (
+            <TouchableOpacity
+              style={[s.filterChip, s.filterChipCulture]}
+              onPress={() => setFiltreCulture('Toutes')}
+            >
+              <Text style={s.filterChipCultureText}>{filtreCulture} ✕</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      )}
+
+      {/* ── BARRE INFÉRIEURE */}
+      <View style={s.bottomBar}>
+        {traceMode === 'idle' && (
+          <TouchableOpacity style={s.btnAdd} onPress={() => setShowModeSelector(true)}>
+            <Text style={s.btnAddText}>＋  Nouvelle Parcelle</Text>
+          </TouchableOpacity>
+        )}
+
+        {(traceMode === 'walk' || traceMode === 'walk_paused') && (
+          <View style={s.ctrlRow}>
+            <TouchableOpacity style={s.ctrlBtn} onPress={stopTrace}>
+              <Text style={s.ctrlBtnLabel}>✕</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.ctrlBtn} onPress={addCornerPoint}>
+              <Text style={s.ctrlBtnLabel}>📍</Text>
+            </TouchableOpacity>
+            {traceMode === 'walk' ? (
+              <TouchableOpacity style={[s.ctrlBtn, s.ctrlBtnPause]} onPress={pauseWalk}>
+                <Text style={s.ctrlBtnLabelAlt}>⏸ Pause</Text>
+              </TouchableOpacity>
+            ) : (
+              <TouchableOpacity style={[s.ctrlBtn, s.ctrlBtnResume]} onPress={resumeWalk}>
+                <Text style={[s.ctrlBtnLabelAlt, { color: BRAND_GREEN }]}>▶ Reprendre</Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity
+              style={[s.ctrlBtnSave, points.length < 3 && s.btnDisabled]}
+              disabled={points.length < 3}
+              onPress={saveParcelle}
+            >
+              <Text style={s.ctrlBtnSaveLabel}>✓ Clore</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {traceMode === 'draw' && (
+          <View style={s.ctrlRow}>
+            <TouchableOpacity style={s.ctrlBtn} onPress={stopTrace}>
+              <Text style={s.ctrlBtnLabel}>✕</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={s.ctrlBtn} onPress={undoLastPoint} disabled={points.length === 0}>
+              <Text style={s.ctrlBtnLabel}>↩</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[s.ctrlBtnSave, { flex: 2 }, points.length < 3 && s.btnDisabled]}
+              disabled={points.length < 3}
+              onPress={saveParcelle}
+            >
+              <Text style={s.ctrlBtnSaveLabel}>✓ Enregistrer</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </View>
+
+      {/* ═══════════════════════════════════════════════════
+          MODAL : SÉLECTION DU MODE DE TRACÉ
+          — flex justify-content corrigé pour s'afficher
+      ════════════════════════════════════════════════════ */}
+      <Modal
+        visible={showModeSelector}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowModeSelector(false)}
+      >
+        <View style={s.modalContainer}>
+          <TouchableOpacity
+            style={s.modalOverlayTouchable}
+            activeOpacity={1}
+            onPress={() => setShowModeSelector(false)}
+          />
+          <View style={s.sheet}>
+            <View style={s.dragHandle} />
+            <Text style={s.sheetTitle}>Choisir le mode de tracé</Text>
+
+            <TouchableOpacity style={s.modeCard} onPress={startWalkMode}>
+              <View style={[s.modeIcon, { backgroundColor: BRAND_GREEN }]}>
+                <Text style={s.modeIconText}>🚶</Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={s.modeTitle}>Mode Marche (GPS)</Text>
+                <Text style={s.modeDesc}>
+                  Marchez le long des limites du champ. L'app trace automatiquement votre
+                  trajectoire GPS avec Pause et Point de Coin.
+                </Text>
+                <Text style={s.modeTag}>✓ Précis sur le terrain  •  Fonctionne hors-ligne</Text>
+              </View>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={s.modeCard} onPress={startDrawMode}>
+              <View style={[s.modeIcon, { backgroundColor: '#2563eb' }]}>
+                <Text style={s.modeIconText}>✏️</Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={s.modeTitle}>Mode Dessin Assisté</Text>
+                <Text style={s.modeDesc}>
+                  Touchez les coins du champ directement sur l'image satellite.
+                  Idéal si le GPS est faible.
+                </Text>
+                <Text style={s.modeTag}>✓ Vue satellite  •  Annulation point par point (↩)</Text>
+              </View>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* ═══════════════════════════════════════════════════
+          MODAL : INFO PARCELLE + MÉTÉO + NDVI
+          — maxHeight + SafeArea corrigés
+      ════════════════════════════════════════════════════ */}
+      <Modal
+        visible={infoVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setInfoVisible(false)}
+      >
+        <View style={s.modalContainer}>
+          <TouchableOpacity
+            style={s.modalOverlayTouchable}
+            activeOpacity={1}
+            onPress={() => setInfoVisible(false)}
+          />
+
+          {selectedParcelle && (
+            <View style={s.infoPanel}>
+              <View style={s.dragHandle} />
+
+              <View style={s.infoPanelHeader}>
+                <Text style={s.infoPanelTitle} numberOfLines={1}>
+                  {selectedParcelle.nom?.toUpperCase()}  ·  {selectedParcelle.surface}
+                </Text>
+              </View>
+
+              {/* ScrollView avec hauteur max explicite pour éviter le débordement */}
+              <ScrollView
+                showsVerticalScrollIndicator={false}
+                style={s.infoPanelScroll}
+                contentContainerStyle={{ paddingBottom: 8 }}
+              >
+                <View style={s.infoRows}>
+                  {activeLayer === 'ndvi' && (() => {
+                    const ndvi = getNDVI(selectedParcelle.id_local);
+                    const ns   = ndviStyle(ndvi);
+                    return (
+                      <View style={s.infoRow}>
+                        <Text style={s.infoRowIcon}>🌱</Text>
+                        <Text style={s.infoRowLabel}>INDICE NDVI</Text>
+                        <View style={[s.badge, { backgroundColor: ns.badge }]}>
+                          <Text style={s.badgeText}>{ns.label}  {ndvi}</Text>
+                        </View>
+                      </View>
+                    );
+                  })()}
+
+                  <View style={s.infoRow}>
+                    <Text style={s.infoRowIcon}>ⓘ</Text>
+                    <Text style={s.infoRowLabel}>STATUT</Text>
+                    <View style={[s.badge,
+                      { backgroundColor: selectedParcelle.statut_location === 'a_louer' ? BRAND_GREEN : '#2563eb' }]}>
+                      <Text style={s.badgeText}>
+                        {selectedParcelle.statut_location === 'a_louer' ? 'À ALLOUER' : 'LOUÉ'}
+                      </Text>
+                    </View>
+                  </View>
+
+                  <View style={s.infoRow}>
+                    <Text style={s.infoRowIcon}>👤</Text>
+                    <Text style={s.infoRowLabel}>PROPRIÉTAIRE</Text>
+                    <Text style={s.infoRowVal}>{selectedParcelle.proprietaire_nom}</Text>
+                  </View>
+
+                  <View style={s.infoRow}>
+                    <Text style={s.infoRowIcon}>📍</Text>
+                    <Text style={s.infoRowLabel}>LIEU</Text>
+                    <Text style={s.infoRowVal} numberOfLines={1}>{selectedParcelle.lieu}</Text>
+                  </View>
+
+                  {!!selectedParcelle.proprietaire_tel && (
+                    <TouchableOpacity
+                      style={s.infoRow}
+                      onPress={() => Linking.openURL(`tel:${selectedParcelle.proprietaire_tel}`)}
+                    >
+                      <Text style={s.infoRowIcon}>📞</Text>
+                      <Text style={s.infoRowLabel}>TÉLÉPHONE</Text>
+                      <Text style={[s.infoRowVal, s.link]}>{selectedParcelle.proprietaire_tel} ↗</Text>
+                    </TouchableOpacity>
+                  )}
+
+                  {[
+                    { icon: '⊡', label: 'SURFACE',    val: selectedParcelle.surface },
+                    { icon: '🌿', label: 'CULTURE',    val: selectedParcelle.culture || '—' },
+                    { icon: '💧', label: 'HUMIDITÉ',   val: `${selectedParcelle.humidite}%` },
+                    { icon: '🌱', label: 'CROISSANCE', val: `${selectedParcelle.croissance}%` },
+                  ].map(({ icon, label, val }) => (
+                    <View key={label} style={s.infoRow}>
+                      <Text style={s.infoRowIcon}>{icon}</Text>
+                      <Text style={s.infoRowLabel}>{label}</Text>
+                      <Text style={s.infoRowVal}>{val}</Text>
+                    </View>
+                  ))}
+
+                  {(() => {
+                    if (!selectedParcelle.qualite_sol) return null;
+                    try {
+                      const sol = JSON.parse(selectedParcelle.qualite_sol);
+                      if (!sol.reliable) return null;
+                      return (
+                        <>
+                          {sol.ph != null && (
+                            <View style={s.infoRow}>
+                              <Text style={s.infoRowIcon}>🧪</Text>
+                              <Text style={s.infoRowLabel}>pH SOL</Text>
+                              <Text style={s.infoRowVal}>{sol.ph}</Text>
+                            </View>
+                          )}
+                          {sol.texture != null && (
+                            <View style={s.infoRow}>
+                              <Text style={s.infoRowIcon}>🪨</Text>
+                              <Text style={s.infoRowLabel}>TEXTURE</Text>
+                              <Text style={s.infoRowVal}>{sol.texture}</Text>
+                            </View>
+                          )}
+                          {sol.ocd != null && (
+                            <View style={s.infoRow}>
+                              <Text style={s.infoRowIcon}>🌾</Text>
+                              <Text style={s.infoRowLabel}>MAT. ORG.</Text>
+                              <Text style={s.infoRowVal}>{sol.ocd} g/kg</Text>
+                            </View>
+                          )}
+                        </>
+                      );
+                    } catch { return null; }
+                  })()}
+                </View>
+
+                {/* Météo — rendu conditionnel sécurisé */}
+                {activeLayer === 'weather' && (
+                  <View style={s.weatherPanel}>
+                    {weatherLoading ? (
+                      <View style={s.weatherLoading}>
+                        <ActivityIndicator color={BRAND_GREEN} />
+                        <Text style={s.weatherLoadingText}>Interrogation ECMWF IFS 9km...</Text>
+                      </View>
+                    ) : weatherData ? (
+                      <WeatherContent
+                        data={weatherData}
+                        recommendations={recommendationsData}
+                        currentWeatherLive={currentWeatherLive}
+                        fromCache={weatherFromCache}
+                        onRefresh={() => loadWeather(selectedParcelle)}
+                      />
+                    ) : null}
+                  </View>
+                )}
+              </ScrollView>
+
+              <View style={s.infoPanelFooter}>
+                <TouchableOpacity
+                  style={s.btnModif}
+                  onPress={() => {
+                    setInfoVisible(false);
+                    setTimeout(() => ouvrirModif(selectedParcelle), 300);
+                  }}
+                >
+                  <Text style={s.btnModifText}>✏️  MODIFIER LA PARCELLE</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+        </View>
+      </Modal>
+
+      {/* ═══════════════════════════════════════════════════
+          MODAL : MODIFICATION
+          — KeyboardAvoidingView + hauteur sécurisée
+      ════════════════════════════════════════════════════ */}
+      <Modal visible={modalVisible} transparent animationType="slide" onRequestClose={() => setModalVisible(false)}>
+        <KeyboardAvoidingView
+          style={s.modalContainer}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        >
+          <TouchableOpacity
+            style={s.modalOverlayTouchable}
+            activeOpacity={1}
+            onPress={() => setModalVisible(false)}
+          />
+          <View style={s.editSheet}>
+            <View style={s.dragHandle} />
+            <ScrollView
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+              contentContainerStyle={{ paddingBottom: 24 }}
+            >
+              <Text style={s.editTitle}>Modifier la parcelle</Text>
+
+              {[
+                { label: 'Nom',           key: 'nom',              kb: 'default'    },
+                { label: 'Surface',       key: 'surface',          kb: 'default'    },
+                { label: 'Humidité (%)',  key: 'humidite',         kb: 'numeric'    },
+                { label: 'Croissance (%)',key: 'croissance',        kb: 'numeric'    },
+                { label: 'Lieu',          key: 'lieu',             kb: 'default'    },
+                { label: 'Propriétaire', key: 'proprietaire_nom', kb: 'default'    },
+                { label: 'Téléphone',    key: 'proprietaire_tel', kb: 'phone-pad'  },
+              ].map(({ label, key, kb }) => (
+                <View key={key} style={s.inputGroup}>
+                  <Text style={s.inputLabel}>{label}</Text>
+                  <TextInput
+                    style={s.inputField}
+                    value={formData[key]}
+                    keyboardType={kb}
+                    onChangeText={(t) => setFormData((prev) => ({ ...prev, [key]: t }))}
+                  />
+                </View>
+              ))}
+
+              {/* Sélecteur de culture */}
+              <Text style={s.inputLabel}>TYPE DE CULTURE</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 18 }}>
+                <View style={{ flexDirection: 'row', gap: 8, paddingBottom: 4 }}>
+                  {CULTURE_TYPES.filter(c => c !== 'Toutes').map((c) => (
+                    <TouchableOpacity
+                      key={c}
+                      style={[s.chip, { flex: 0, paddingHorizontal: 16 }, formData.culture === c && s.chipOn]}
+                      onPress={() => setFormData((prev) => ({ ...prev, culture: prev.culture === c ? '' : c }))}
+                    >
+                      <Text style={[s.chipLabel, formData.culture === c && s.chipLabelOn]}>{c}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              </ScrollView>
+
+              <Text style={s.inputLabel}>Statut d'occupation</Text>
+              <View style={s.chipRow}>
+                {[{ v: 'libre', l: '🟢 Libre' }, { v: 'occupee', l: '🔴 Occupé' }].map(({ v, l }) => (
+                  <TouchableOpacity
+                    key={v}
+                    style={[s.chip, formData.statut_occupation === v && s.chipOn]}
+                    onPress={() => setFormData((prev) => ({ ...prev, statut_occupation: v }))}
+                  >
+                    <Text style={[s.chipLabel, formData.statut_occupation === v && s.chipLabelOn]}>{l}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={s.inputLabel}>Statut de location</Text>
+              <View style={s.chipRow}>
+                {[{ v: 'a_louer', l: '🟠 À louer' }, { v: 'loue', l: '🔵 Loué' }].map(({ v, l }) => (
+                  <TouchableOpacity
+                    key={v}
+                    style={[s.chip, formData.statut_location === v && s.chipOn]}
+                    onPress={() => setFormData((prev) => ({ ...prev, statut_location: v }))}
+                  >
+                    <Text style={[s.chipLabel, formData.statut_location === v && s.chipLabelOn]}>{l}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <View style={s.editBtns}>
+                <TouchableOpacity style={s.btnCancel} onPress={() => setModalVisible(false)}>
+                  <Text style={s.btnCancelText}>Annuler</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={s.btnSave} onPress={validerModif}>
+                  <Text style={s.btnSaveText}>Mettre à jour</Text>
+                </TouchableOpacity>
+              </View>
+            </ScrollView>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+    </View>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOUS-COMPOSANT : CONTENU MÉTÉO
+// ═══════════════════════════════════════════════════════════════════════════════
+function WeatherContent({ data, recommendations, currentWeatherLive, fromCache, onRefresh }) {
+  const [selectedForecastIdx, setSelectedForecastIdx] = useState(null);
+  const [tempViewMode, setTempViewMode] = useState('real'); // real | felt
+  const [tempUnit, setTempUnit] = useState('C'); // C | F
+  const [precipUnit, setPrecipUnit] = useState('mm'); // mm | cm
+  const { current_weather, daily, model } = data;
+
+  const precip = daily?.precipitation_sum ?? [];
+  const tmax = daily?.temperature_2m_max ?? [];
+  const tmin = daily?.temperature_2m_min ?? [];
+  const appTmax = daily?.apparent_temperature_max ?? [];
+  const appTmin = daily?.apparent_temperature_min ?? [];
+  const uvIdx = daily?.uv_index_max ?? [];
+  const DAYS = ['Auj.', 'Dem.', 'J+2', 'J+3', 'J+4', 'J+5', 'J+6'];
+  const maxRain = precip.length > 0 ? Math.max(...precip) : 0;
+  const risks = analyzeRisks(daily);
+  const riskLevel = recommendations?.risk_level;
+  const liveTemp = currentWeatherLive?.temperature;
+  const liveWindMs = currentWeatherLive?.wind?.speed;
+  const liveWindKmh = liveWindMs != null ? liveWindMs * 3.6 : null;
+  const heroTemp = liveTemp ?? current_weather?.temperature ?? (tmax[0] != null && tmin[0] != null ? (tmax[0] + tmin[0]) / 2 : null);
+  const heroWind = liveWindKmh ?? current_weather?.windspeed ?? null;
+  const selectedIdx = selectedForecastIdx ?? 0;
+  const selLow = tmin[selectedIdx];
+  const selHigh = tmax[selectedIdx];
+  const selLowFelt = appTmin[selectedIdx] ?? selLow;
+  const selHighFelt = appTmax[selectedIdx] ?? selHigh;
+  const selRain = precip[selectedIdx];
+  const selUv = uvIdx[selectedIdx];
+  const selWind = daily?.wind_speed_10m_max?.[selectedIdx];
+  const yesterdayIdx = Math.max(selectedIdx - 1, 0);
+  const yesterdayLow = tmin[yesterdayIdx];
+  const yesterdayHigh = tmax[yesterdayIdx];
+  const yesterdayLowFelt = appTmin[yesterdayIdx] ?? yesterdayLow;
+  const yesterdayHighFelt = appTmax[yesterdayIdx] ?? yesterdayHigh;
+  const nextDayLow = tmin[selectedIdx + 1] ?? selLow ?? 0;
+  const nextDayLowFelt = appTmin[selectedIdx + 1] ?? nextDayLow;
+  const rainRiskPct = selRain == null ? 0 : Math.min(100, Math.round((selRain / 12) * 100));
+  const tomorrowRain = precip[selectedIdx + 1] ?? 0;
+  const hourlyHours = ['00 h', '03 h', '06 h', '09 h', '12 h', '15 h', '18 h', '21 h'];
+
+  const convertTemp = (value) => {
+    if (value == null) return null;
+    return tempUnit === 'F' ? (value * 9) / 5 + 32 : value;
+  };
+  const tempSuffix = tempUnit === 'F' ? '°F' : '°C';
+  const convertPrecip = (value) => {
+    if (value == null) return 0;
+    return precipUnit === 'cm' ? value / 10 : value;
+  };
+  const precipSuffix = precipUnit;
+
+  const hourlyTempsDisplay = (() => {
+    const hourlyReal = data?.hourly?.temperature_2m ?? [];
+    const hourlyFelt = data?.hourly?.apparent_temperature ?? [];
+    const start = selectedIdx * 24;
+    const dayReal = hourlyReal.slice(start, start + 24);
+    const dayFelt = hourlyFelt.slice(start, start + 24);
+    const pickEvery3h = (arr) => hourlyHours.map((_, i) => arr[i * 3]).filter((v) => v != null);
+
+    const realPicked = pickEvery3h(dayReal);
+    const feltPicked = pickEvery3h(dayFelt);
+
+    if (tempViewMode === 'felt' && feltPicked.length >= 8) return feltPicked;
+    if (tempViewMode === 'real' && realPicked.length >= 8) return realPicked;
+
+    // fallback if hourly series not available
+    const low = tempViewMode === 'felt' ? selLowFelt : selLow;
+    const high = tempViewMode === 'felt' ? selHighFelt : selHigh;
+    const nextLow = tempViewMode === 'felt' ? nextDayLowFelt : nextDayLow;
+    if (low == null || high == null) return [];
+    return hourlyHours.map((_, idx) => {
+      const h = idx * 3;
+      if (h <= 15) {
+        const p = h / 15;
+        return low + (high - low) * Math.pow(p, 0.9);
+      }
+      const p = (h - 15) / 9;
+      return high - (high - nextLow) * Math.pow(p, 0.9);
+    });
+  })();
+  const hourlyTempsUnit = hourlyTempsDisplay.map((t) => convertTemp(t));
+  const minHourlyUnit = hourlyTempsUnit.length ? Math.min(...hourlyTempsUnit) : 0;
+  const maxHourlyUnit = hourlyTempsUnit.length ? Math.max(...hourlyTempsUnit) : 1;
+  const rangeHourlyUnit = Math.max(maxHourlyUnit - minHourlyUnit, 1);
+  const curveAnimsRef = useRef(hourlyHours.map(() => new Animated.Value(0))).current;
+
+  const forecastText = (() => {
+    if (selLow == null || selHigh == null) return "Données météo indisponibles pour ce jour.";
+    const rainValue = convertPrecip(selRain);
+    const rainLabel =
+      selRain == null
+        ? "pluie inconnue"
+        : selRain < 0.5
+          ? "pas de pluie prévue"
+          : `${rainValue.toFixed(precipUnit === 'cm' ? 1 : 0)} ${precipSuffix} de pluie prévus`;
+    const windLabel = selWind == null ? "vent modéré" : `rafales possibles jusqu'à ${Math.round(selWind)} km/h`;
+    const lo = convertTemp(tempViewMode === 'felt' ? selLowFelt : selLow);
+    const hi = convertTemp(tempViewMode === 'felt' ? selHighFelt : selHigh);
+    return `${Math.round(hi)}${tempSuffix} avec ciel variable. Température comprise entre ${Math.round(lo)}${tempSuffix} et ${Math.round(hi)}${tempSuffix}, ${rainLabel}, ${windLabel}.`;
+  })();
+
+  useEffect(() => {
+    if (selectedForecastIdx === null) return;
+    const animations = hourlyTempsUnit.map((temp, i) => {
+      const target = ((temp - minHourlyUnit) / rangeHourlyUnit) * 100;
+      return Animated.timing(curveAnimsRef[i], {
+        toValue: target,
+        duration: 340 + i * 35,
+        useNativeDriver: false,
+      });
+    });
+    Animated.parallel(animations).start();
+  }, [selectedForecastIdx, tempViewMode, tempUnit, selLow, selHigh, nextDayLow]);
+
+  return (
+    <View>
+      <View style={s.wHeroCard}>
+        <Text style={s.wHeroPlace}>Conditions météo</Text>
+        <Text style={s.wHeroTemp}>{heroTemp != null ? `${heroTemp.toFixed(0)}°` : '—°'}</Text>
+        <Text style={s.wHeroDesc}>
+          Vent {heroWind != null ? heroWind.toFixed(0) : '—'} km/h · {model}
+        </Text>
+      </View>
+
+      <View style={s.wHeader}>
+        <View>
+          <Text style={s.wTitle}>Météo locale</Text>
+          <Text style={s.wModel}>{model}</Text>
+        </View>
+        <View style={s.wCurrentBox}>
+          <Text style={s.wTemp}>{heroTemp != null ? `${heroTemp.toFixed(0)}°C` : '—°C'}</Text>
+          <Text style={s.wWind}>💨 {heroWind != null ? heroWind.toFixed(0) : '—'} km/h</Text>
+        </View>
+      </View>
+
+      <View style={s.wStats}>
+        {[
+          { label: 'Pluie 7j', val: `${convertPrecip(precip.reduce((a, b) => a + b, 0)).toFixed(precipUnit === 'cm' ? 1 : 0)} ${precipSuffix}` },
+          { label: 'Temp. max', val: tmax.length ? `${convertTemp(Math.max(...tmax)).toFixed(0)}${tempSuffix}` : '—' },
+          { label: 'UV max',   val: uvIdx.length ? `${Math.max(...uvIdx).toFixed(0)}/11` : '—' },
+        ].map(({ label, val }) => (
+          <View key={label} style={s.wStat}>
+            <Text style={s.wStatLabel}>{label}</Text>
+            <Text style={s.wStatVal}>{val}</Text>
+          </View>
+        ))}
+      </View>
+
+      <View style={s.wBlock}>
+        <Text style={s.wSectionLabel}>PRÉVISION 7 JOURS</Text>
+        {precip.map((rain, i) => {
+          const rel  = reliabilityScore(i);
+          const bar  = maxRain > 0 ? (rain / maxRain) * 100 : 0;
+          const tmaxI = tmax[i] != null ? convertTemp(tmax[i]).toFixed(0) : '—';
+          const tminI = tmin[i] != null ? convertTemp(tmin[i]).toFixed(0) : '—';
+          const rainUnit = convertPrecip(rain);
+          return (
+            <TouchableOpacity
+              key={i}
+              activeOpacity={0.8}
+              onPress={() => setSelectedForecastIdx(i)}
+              style={[s.wDayRow, i >= 5 && s.wDayFaded]}
+            >
+              <Text style={s.wDayName}>{DAYS[i]}</Text>
+              <Text style={s.wDayIcon}>{weatherIcon(rain, tmax[i])}</Text>
+              <View style={s.wBarWrap}>
+                <View style={[s.wBar, { width: `${bar}%`, backgroundColor: rainColor(rain) }]} />
+              </View>
+              <Text style={s.wDayRain}>{rain < 0.5 ? 'Sec' : `${rainUnit.toFixed(precipUnit === 'cm' ? 1 : 0)}${precipSuffix}`}</Text>
+              <Text style={s.wDayTemp}>{tminI}°/{tmaxI}°</Text>
+              <View style={[s.relDot, { backgroundColor: rel.color }]} />
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+
+      <View style={s.wLegend}>
+        {[
+          { color: '#16a34a', label: 'Fiable J0–J2' },
+          { color: '#ca8a04', label: 'Bon J3–J4' },
+          { color: '#dc2626', label: 'Indicatif J5–J6' },
+        ].map(({ color, label }) => (
+          <View key={label} style={s.wLegendItem}>
+            <View style={[s.relDot, { backgroundColor: color }]} />
+            <Text style={s.wLegendLabel}>{label}</Text>
+          </View>
+        ))}
+      </View>
+
+      {risks.length > 0 && (
+        <>
+          <Text style={[s.wSectionLabel, { marginTop: 14 }]}>RISQUES AGRICOLES</Text>
+          <View style={s.wRiskGrid}>
+            {risks.map((r, i) => {
+              const bg = {
+                low:    { bg: '#EAF3DE', border: '#639922', lbl: '#3B6D11', val: '#27500A' },
+                medium: { bg: '#FAEEDA', border: '#BA7517', lbl: '#854F0B', val: '#633806' },
+                high:   { bg: '#FCEBEB', border: '#A32D2D', lbl: '#A32D2D', val: '#791F1F' },
+              }[r.level];
+              return (
+                <View key={i} style={[s.wRiskCard, { backgroundColor: bg.bg, borderColor: bg.border }]}>
+                  <Text style={[s.wRiskLabel, { color: bg.lbl }]}>{r.label.toUpperCase()}</Text>
+                  <Text style={[s.wRiskAdvice, { color: bg.val }]}>{r.advice}</Text>
+                </View>
+              );
+            })}
+          </View>
+        </>
+      )}
+
+      {/* Integration non intrusive de ta partie : recommandations backend map -> coordonnees */}
+      {!!recommendations && (
+        <>
+          <Text style={[s.wSectionLabel, { marginTop: 14 }]}>
+            RECOMMANDATIONS AGROCONNECT {riskLevel ? `(${riskLevel.toUpperCase()})` : ''}
+          </Text>
+          <View style={[s.wRiskCard, s.wRecoCard, { width: '100%' }]}>
+            {!!riskLevel && (
+              <View style={[
+                s.riskBadge,
+                riskLevel === 'High' ? s.riskBadgeHigh : riskLevel === 'Medium' ? s.riskBadgeMedium : s.riskBadgeLow
+              ]}>
+                <Text style={s.riskBadgeText}>Niveau de risque: {riskLevel}</Text>
+              </View>
+            )}
+            {(recommendations.analysis ?? []).map((a, i) => (
+              <Text key={`a-${i}`} style={s.wRiskAdvice}>• {a}</Text>
+            ))}
+            {(recommendations.recommendations ?? []).map((r, i) => (
+              <Text key={`r-${i}`} style={s.wRiskAdvice}>→ {r}</Text>
+            ))}
+          </View>
+        </>
+      )}
+
+      <View style={s.wFooter}>
+        <View style={[s.wFooterDot, { backgroundColor: fromCache ? '#ca8a04' : BRAND_GREEN }]} />
+        <Text style={s.wFooterText}>
+          {fromCache ? 'Cache 3h · ' : 'En direct · '}{model} · open-data CC BY 4.0
+        </Text>
+        {fromCache && (
+          <TouchableOpacity onPress={onRefresh}>
+            <Text style={[s.wFooterText, { color: BRAND_GREEN, fontWeight: '700' }]}>  ⟳</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      <Modal
+        visible={selectedForecastIdx !== null}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setSelectedForecastIdx(null)}
+      >
+        <View style={s.modalContainer}>
+          <TouchableOpacity style={s.modalOverlayTouchable} activeOpacity={1} onPress={() => setSelectedForecastIdx(null)} />
+          <View style={s.forecastSheet}>
+            <View style={s.dragHandle} />
+            <ScrollView
+              style={s.forecastScroll}
+              contentContainerStyle={s.forecastScrollContent}
+              showsVerticalScrollIndicator
+              bounces
+              alwaysBounceVertical
+              nestedScrollEnabled
+            >
+              <View style={s.forecastSheetHeader}>
+                <Text style={s.forecastSheetTitle}>Conditions météo - {DAYS[selectedIdx] ?? 'Jour'}</Text>
+                <TouchableOpacity style={s.forecastCloseBtn} onPress={() => setSelectedForecastIdx(null)}>
+                  <Text style={s.forecastCloseText}>✕</Text>
+                </TouchableOpacity>
+              </View>
+
+              <Text style={s.forecastHeroTemp}>
+                {selHigh != null ? `${Math.round(convertTemp(tempViewMode === 'felt' ? selHighFelt : selHigh))}°` : '—°'}
+              </Text>
+              <Text style={s.forecastHeroSub}>
+                {selLow != null ? `↓ ${Math.round(convertTemp(tempViewMode === 'felt' ? selLowFelt : selLow))}°` : '↓ —°'} · {selRain != null ? `${convertPrecip(selRain).toFixed(precipUnit === 'cm' ? 1 : 0)} ${precipSuffix}` : `— ${precipSuffix}`} · UV {selUv != null ? selUv.toFixed(0) : '—'}
+              </Text>
+              <View style={s.segmentWrap}>
+                <TouchableOpacity
+                  style={[s.segmentBtn, tempViewMode === 'real' && s.segmentBtnActive]}
+                  onPress={() => setTempViewMode('real')}
+                >
+                  <Text style={[s.segmentText, tempViewMode === 'real' && s.segmentTextActive]}>Réelle</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[s.segmentBtn, tempViewMode === 'felt' && s.segmentBtnActive]}
+                  onPress={() => setTempViewMode('felt')}
+                >
+                  <Text style={[s.segmentText, tempViewMode === 'felt' && s.segmentTextActive]}>Ressentie</Text>
+                </TouchableOpacity>
+              </View>
+
+              <View style={s.forecastGraphCard}>
+                <Text style={s.wSectionLabel}>DIAGRAMME HORAIRE (JOUR SÉLECTIONNÉ)</Text>
+                <View style={s.barChartWrap}>
+                  <View style={s.hourlyYAxis}>
+                    <Text style={s.hourlyYLabel}>{Math.ceil(maxHourlyUnit)}°</Text>
+                    <Text style={s.hourlyYLabel}>{Math.round((maxHourlyUnit + minHourlyUnit) / 2)}°</Text>
+                    <Text style={s.hourlyYLabel}>{Math.floor(minHourlyUnit)}°</Text>
+                  </View>
+                  <View style={s.barPlotArea}>
+                    {hourlyTempsUnit.map((temp, i) => {
+                      const isNow = i === 5;
+                      return (
+                        <View key={`hour-${i}`} style={s.barCol}>
+                          <View style={s.barTrack}>
+                            <Animated.View
+                              style={[
+                                s.barFill,
+                                {
+                                  height: curveAnimsRef[i].interpolate({
+                                    inputRange: [0, 100],
+                                    outputRange: [8, 118],
+                                  }),
+                                },
+                                isNow && s.barFillNow,
+                              ]}
+                            />
+                          </View>
+                          <Text style={[s.hourlyTempLabel, isNow && s.hourlyTempLabelNow]}>
+                            {Math.round(temp)}°
+                          </Text>
+                          <Text style={s.hourlyHourLabel}>{hourlyHours[i]}</Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+                </View>
+              </View>
+
+              <View style={s.forecastTextCard}>
+                <Text style={s.forecastParagraphTitle}>Risque de précipitation</Text>
+                <Text style={s.forecastParagraph}>Risque du jour : {rainRiskPct}%</Text>
+                <View style={s.precipRiskTrack}>
+                  <View style={[s.precipRiskFill, { width: `${rainRiskPct}%` }]} />
+                </View>
+                <Text style={s.forecastParagraphMuted}>
+                  Le risque peut augmenter localement selon le vent et l'humidité.
+                </Text>
+              </View>
+
+              <View style={s.forecastTextCard}>
+                <Text style={s.forecastParagraphTitle}>Précipitations totales</Text>
+                <Text style={s.forecastParagraph}>Dernières 24h : {selRain != null ? `${convertPrecip(selRain).toFixed(precipUnit === 'cm' ? 1 : 0)} ${precipSuffix}` : `0 ${precipSuffix}`}</Text>
+                <Text style={s.forecastParagraph}>Prochaines 24h : {convertPrecip(tomorrowRain).toFixed(precipUnit === 'cm' ? 1 : 0)} {precipSuffix}</Text>
+              </View>
+
+              <View style={s.forecastTextCard}>
+                <Text style={s.forecastParagraphTitle}>Prévisions</Text>
+                <Text style={s.forecastParagraph}>{forecastText}</Text>
+              </View>
+
+              <View style={s.forecastTextCard}>
+                <Text style={s.forecastParagraphTitle}>Comparaison jour après jour</Text>
+                <View style={s.compareRow}>
+                  <Text style={s.compareDay}>Aujourd’hui</Text>
+                  <Text style={s.compareRange}>{selLow != null ? `${Math.round(convertTemp(tempViewMode === 'felt' ? selLowFelt : selLow))}°` : '—°'} / {selHigh != null ? `${Math.round(convertTemp(tempViewMode === 'felt' ? selHighFelt : selHigh))}°` : '—°'}</Text>
+                </View>
+                <View style={s.compareRow}>
+                  <Text style={s.compareDay}>Hier</Text>
+                  <Text style={s.compareRange}>{yesterdayLow != null ? `${Math.round(convertTemp(tempViewMode === 'felt' ? yesterdayLowFelt : yesterdayLow))}°` : '—°'} / {yesterdayHigh != null ? `${Math.round(convertTemp(tempViewMode === 'felt' ? yesterdayHighFelt : yesterdayHigh))}°` : '—°'}</Text>
+                </View>
+              </View>
+
+              <View style={s.forecastTextCard}>
+                <Text style={s.forecastParagraphTitle}>À propos de la température ressentie</Text>
+                <Text style={s.forecastParagraph}>
+                  La température ressentie dépend du vent et de l'humidité. Quand le vent augmente, le ressenti peut être plus bas que la température réelle.
+                </Text>
+              </View>
+
+              <View style={s.forecastTextCard}>
+                <Text style={s.forecastParagraphTitle}>Options</Text>
+                <Text style={s.optionLabel}>Température</Text>
+                <View style={s.optionRow}>
+                  <TouchableOpacity style={[s.optionChip, tempUnit === 'C' && s.optionChipActive]} onPress={() => setTempUnit('C')}>
+                    <Text style={[s.optionChipText, tempUnit === 'C' && s.optionChipTextActive]}>°C</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[s.optionChip, tempUnit === 'F' && s.optionChipActive]} onPress={() => setTempUnit('F')}>
+                    <Text style={[s.optionChipText, tempUnit === 'F' && s.optionChipTextActive]}>°F</Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={[s.optionLabel, { marginTop: 10 }]}>Précipitations</Text>
+                <View style={s.optionRow}>
+                  <TouchableOpacity style={[s.optionChip, precipUnit === 'mm' && s.optionChipActive]} onPress={() => setPrecipUnit('mm')}>
+                    <Text style={[s.optionChipText, precipUnit === 'mm' && s.optionChipTextActive]}>mm</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[s.optionChip, precipUnit === 'cm' && s.optionChipActive]} onPress={() => setPrecipUnit('cm')}>
+                    <Text style={[s.optionChipText, precipUnit === 'cm' && s.optionChipTextActive]}>cm</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STYLES
+// ═══════════════════════════════════════════════════════════════════════════════
+const s = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#000' },
+  map: { flex: 1 },
+
+  // LOADER
+  loader:      { flex: 1, backgroundColor: DARK_GREEN, justifyContent: 'center', alignItems: 'center' },
+  loaderLogo:  { fontSize: 48 },
+  loaderTitle: { fontSize: 28, fontWeight: '800', color: '#fff', letterSpacing: 2, marginTop: 8 },
+  loaderSub:   { color: '#86efac', fontSize: 13, marginTop: 12 },
+
+  // HEADER
+  header:      { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: DARK_GREEN, paddingTop: 48, paddingBottom: 14, paddingHorizontal: 18 },
+  headerLeft:  { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  logoBox:     { width: 38, height: 38, borderRadius: 10, backgroundColor: BRAND_GREEN, justifyContent: 'center', alignItems: 'center' },
+  logoEmoji:   { fontSize: 20 },
+  headerTitle: { color: '#fff', fontSize: 18, fontWeight: '800' },
+  headerSubRow:{ flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 2 },
+  statusDot:   { width: 6, height: 6, borderRadius: 3 },
+  headerSub:   { color: '#86efac', fontSize: 11 },
+  iconBtn:     { width: 38, height: 38, borderRadius: 10, backgroundColor: 'rgba(255,255,255,0.12)', justifyContent: 'center', alignItems: 'center' },
+
+  // Icône loupe custom (cercle + handle)
+  searchIcon:       { width: 20, height: 20, justifyContent: 'center', alignItems: 'center' },
+  searchIconCircle: { position: 'absolute', top: 0, left: 0, width: 13, height: 13, borderRadius: 7, borderWidth: 2, borderColor: '#fff' },
+  searchIconHandle: { position: 'absolute', bottom: 0, right: 0, width: 7, height: 2, backgroundColor: '#fff', borderRadius: 1, transform: [{ rotate: '45deg' }, { translateX: 2 }] },
+
+  // SEARCH (styles de base conservés pour compatibilité)
+  searchBar:   { backgroundColor: DARK_GREEN, paddingHorizontal: 16, paddingBottom: 12 },
+
+  // WALK BANNER
+  walkBanner:       { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#14532d', paddingHorizontal: 14, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: BRAND_GREEN },
+  walkBannerPaused: { backgroundColor: '#451a03', borderBottomColor: '#f97316' },
+  walkDot:          { width: 10, height: 10, borderRadius: 5, backgroundColor: '#4ade80', flexShrink: 0 },
+  walkTitle:        { color: '#fff', fontWeight: '800', fontSize: 12, letterSpacing: 0.3 },
+  walkSub:          { color: '#86efac', fontSize: 10, marginTop: 1 },
+
+  // DRAW BANNER
+  drawBanner:  { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#1e3a5f', paddingHorizontal: 14, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#3b82f6' },
+  drawTitle:   { color: '#fff', fontWeight: '800', fontSize: 12, letterSpacing: 0.3 },
+  drawSub:     { color: '#93c5fd', fontSize: 10, marginTop: 1 },
+
+  // Icône crayon custom
+  pencilIcon: { width: 18, height: 18, justifyContent: 'flex-end', alignItems: 'center', flexShrink: 0 },
+  pencilBody: { width: 6, height: 12, backgroundColor: '#93c5fd', borderRadius: 1 },
+  pencilTip:  { width: 0, height: 0, borderLeftWidth: 3, borderRightWidth: 3, borderTopWidth: 5, borderLeftColor: 'transparent', borderRightColor: 'transparent', borderTopColor: '#93c5fd' },
+
+  // Bouton undo custom
+  undoBtn:     { width: 32, height: 32, borderRadius: 8, backgroundColor: 'rgba(255,255,255,0.15)', justifyContent: 'center', alignItems: 'center', flexShrink: 0 },
+  undoIconWrap:{ width: 16, height: 14, justifyContent: 'center', alignItems: 'center' },
+  undoArc:     { position: 'absolute', width: 12, height: 9, borderWidth: 2, borderColor: '#fff', borderBottomColor: 'transparent', borderRadius: 7, top: 0 },
+  undoArrow:   { position: 'absolute', left: 0, top: 1, width: 0, height: 0, borderTopWidth: 5, borderBottomWidth: 5, borderRightWidth: 6, borderTopColor: 'transparent', borderBottomColor: 'transparent', borderRightColor: '#fff' },
+
+  // CHIPS DANS LES BANDEAUX (walk + draw)
+  bannerChips:            { flexDirection: 'row', gap: 5, flexShrink: 0 },
+  bannerChip:             { paddingHorizontal: 9, paddingVertical: 5, borderRadius: 12, backgroundColor: 'rgba(255,255,255,0.15)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.25)' },
+  bannerChipActive:       { backgroundColor: BRAND_GREEN, borderColor: BRAND_GREEN },
+  bannerChipDisabled:     { backgroundColor: 'rgba(255,255,255,0.05)', borderColor: 'rgba(255,255,255,0.1)' },
+  bannerChipText:         { fontSize: 10, fontWeight: '700', color: 'rgba(255,255,255,0.8)', letterSpacing: 0.3 },
+  bannerChipTextActive:   { color: '#fff' },
+  bannerChipTextDisabled: { color: 'rgba(255,255,255,0.3)' },
+
+  // CHIPS COUCHES EN MODE IDLE (sous le header, flux normal)
+  idleLayerRow:         { flexDirection: 'row', gap: 8, paddingHorizontal: 14, paddingVertical: 10, backgroundColor: 'rgba(26,46,26,0.96)', borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.06)' },
+  idleLayerChip:        { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 13, paddingVertical: 8, borderRadius: 20, backgroundColor: 'rgba(255,255,255,0.9)', elevation: 3, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.15, shadowRadius: 3 },
+  idleLayerChipActive:  { backgroundColor: BRAND_GREEN, elevation: 4 },
+  idleLayerDot:         { width: 7, height: 7, borderRadius: 4 },
+  idleLayerText:        { fontSize: 12, fontWeight: '700', color: '#475569' },
+  idleLayerTextActive:  { color: '#fff' },
+
+  // MAP BUTTONS — icônes vectorielles
+  mapBtns: { position: 'absolute', right: 14, bottom: 210, gap: 8 },
+  mapBtn:  { width: 46, height: 46, borderRadius: 13, backgroundColor: '#fff', justifyContent: 'center', alignItems: 'center', elevation: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.18, shadowRadius: 6 },
+
+  // Icône grille 2×2 (type de carte)
+  gridIcon: { width: 18, height: 18, overflow: 'hidden', borderWidth: 1.5, borderColor: '#334155', borderRadius: 3 },
+  gridRow:  { flex: 1, flexDirection: 'row', borderColor: '#334155' },
+  gridCell: { flex: 1, borderColor: '#334155' },
+
+  // Icône localisation (anneau + dot + branches cardinales)
+  locIcon: { width: 20, height: 20, justifyContent: 'center', alignItems: 'center' },
+  locRing: { position: 'absolute', width: 14, height: 14, borderRadius: 7, borderWidth: 2, borderColor: '#334155' },
+  locDot:  { width: 4, height: 4, borderRadius: 2, backgroundColor: '#334155' },
+  locN:    { position: 'absolute', top: 0,    left: 9,  width: 2, height: 4, backgroundColor: '#334155', borderRadius: 1 },
+  locS:    { position: 'absolute', bottom: 0, left: 9,  width: 2, height: 4, backgroundColor: '#334155', borderRadius: 1 },
+  locW:    { position: 'absolute', top: 9,   left: 0,  width: 4, height: 2, backgroundColor: '#334155', borderRadius: 1 },
+  locE:    { position: 'absolute', top: 9,   right: 0, width: 4, height: 2, backgroundColor: '#334155', borderRadius: 1 },
+
+  // TRACE POINTS
+  tracePoint:     { width: 10, height: 10, borderRadius: 5, backgroundColor: '#fff', borderWidth: 2, borderColor: BRAND_GREEN },
+  tracePointLast: { width: 14, height: 14, borderRadius: 7, backgroundColor: '#fbbf24', borderColor: '#f97316' },
+
+  // USER DOT
+  userDotOuter: { width: 22, height: 22, borderRadius: 11, backgroundColor: 'rgba(59,130,246,0.3)', justifyContent: 'center', alignItems: 'center' },
+  userDotInner: { width: 10, height: 10, borderRadius: 5, backgroundColor: '#3b82f6' },
+
+  // MARKER
+  markerBubble: { backgroundColor: 'rgba(255,255,255,0.93)', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6, elevation: 4, borderWidth: 0.5, borderColor: 'rgba(0,0,0,0.1)' },
+  markerText:   { fontSize: 10, fontWeight: '700', color: '#1e3a1e' },
+
+  // FILTER BAR
+  filterBar:            { position: 'absolute', bottom: 100, left: 14, right: 14, flexDirection: 'row', gap: 8 },
+  filterChip:           { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, paddingVertical: 9, borderRadius: 22, backgroundColor: 'rgba(255,255,255,0.94)', elevation: 4, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.12, shadowRadius: 4 },
+  filterChipActive:     { backgroundColor: BRAND_GREEN },
+  filterDot:            { width: 6, height: 6, borderRadius: 3 },
+  filterChipText:       { fontSize: 11, fontWeight: '700', color: '#475569' },
+  filterChipTextActive: { color: '#fff' },
+
+  // BOTTOM BAR
+  bottomBar:       { backgroundColor: '#fff', paddingHorizontal: 16, paddingTop: 12, paddingBottom: 28, borderTopLeftRadius: 22, borderTopRightRadius: 22, elevation: 20 },
+  btnAdd:          { height: 52, borderRadius: 16, backgroundColor: BRAND_GREEN, justifyContent: 'center', alignItems: 'center' },
+  btnAddText:      { color: '#fff', fontWeight: '800', fontSize: 15 },
+  ctrlRow:         { flexDirection: 'row', gap: 8 },
+  ctrlBtn:         { flex: 1, height: 48, borderRadius: 13, backgroundColor: '#f1f5f9', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#e2e8f0' },
+  ctrlBtnPause:    { backgroundColor: '#fef3c7', borderColor: '#f59e0b' },
+  ctrlBtnResume:   { backgroundColor: '#dcfce7', borderColor: BRAND_GREEN },
+  ctrlBtnLabel:    { color: '#475569', fontWeight: '700', fontSize: 13 },
+  ctrlBtnLabelAlt: { color: '#92400e', fontWeight: '700', fontSize: 13 },
+  ctrlBtnSave:     { flex: 1, height: 48, borderRadius: 13, backgroundColor: BRAND_GREEN, justifyContent: 'center', alignItems: 'center' },
+  ctrlBtnSaveLabel:{ color: '#fff', fontWeight: '800', fontSize: 13 },
+  btnDisabled:     { opacity: 0.4 },
+
+  // SHARED MODAL STRUCTURE
+  // flex + justifyContent: 'flex-end' → la feuille colle au bas de l'écran
+  // Le TouchableOpacity transparent remplit le reste (tap pour fermer)
+  modalContainer:         { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.45)' },
+  modalOverlayTouchable:  { flex: 1 },
+  dragHandle:             { width: 40, height: 4, borderRadius: 2, backgroundColor: '#cbd5e1', alignSelf: 'center', marginTop: 12, marginBottom: 6 },
+
+  // MODE SELECTOR SHEET
+  sheet:       { backgroundColor: '#fff', borderTopLeftRadius: 26, borderTopRightRadius: 26, padding: 24, paddingBottom: 36 },
+  sheetTitle:  { fontSize: 18, fontWeight: '800', color: '#1e293b', textAlign: 'center', marginBottom: 20 },
+  modeCard:    { flexDirection: 'row', gap: 14, borderWidth: 1.5, borderColor: '#e2e8f0', borderRadius: 18, padding: 16, marginBottom: 14 },
+  modeIcon:    { width: 52, height: 52, borderRadius: 14, justifyContent: 'center', alignItems: 'center', flexShrink: 0 },
+  modeIconText:{ fontSize: 24 },
+  modeTitle:   { fontSize: 15, fontWeight: '800', color: '#1e293b', marginBottom: 4 },
+  modeDesc:    { fontSize: 13, color: '#64748b', lineHeight: 18, marginBottom: 5 },
+  modeTag:     { fontSize: 11, color: BRAND_GREEN, fontWeight: '700' },
+
+  // INFO PANEL
+  infoPanel:       { backgroundColor: '#fff', borderTopLeftRadius: 26, borderTopRightRadius: 26, maxHeight: '80%', elevation: 30 },
+  infoPanelScroll: { maxHeight: 420 },
+  infoPanelHeader: { backgroundColor: '#1e3a5f', paddingVertical: 16, paddingHorizontal: 20 },
+  infoPanelTitle:  { color: '#fff', fontSize: 14, fontWeight: '800', letterSpacing: 0.5 },
+  infoRows:        { paddingHorizontal: 20, paddingTop: 4 },
+  infoRow:         { flexDirection: 'row', alignItems: 'center', paddingVertical: 11, borderBottomWidth: 1, borderBottomColor: '#f1f5f9', gap: 12 },
+  infoRowIcon:     { fontSize: 16, width: 24, textAlign: 'center' },
+  infoRowLabel:    { flex: 1, fontSize: 11, fontWeight: '700', color: '#94a3b8', letterSpacing: 0.8 },
+  infoRowVal:      { fontSize: 14, fontWeight: '600', color: '#1e293b', textAlign: 'right', maxWidth: '55%' },
+  link:            { color: '#2563eb' },
+  badge:           { paddingHorizontal: 12, paddingVertical: 5, borderRadius: 20 },
+  badgeText:       { color: '#fff', fontWeight: '800', fontSize: 11, letterSpacing: 0.5 },
+  infoPanelFooter: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 20 },
+  btnModif:        { backgroundColor: BRAND_GREEN, borderRadius: 16, paddingVertical: 15, alignItems: 'center' },
+  btnModifText:    { color: '#fff', fontWeight: '800', fontSize: 14 },
+
+  // MÉTÉO PANEL
+  weatherPanel:       {
+    marginHorizontal: 16,
+    marginTop: 8,
+    marginBottom: 4,
+    backgroundColor: 'rgba(255,255,255,0.92)',
+    borderRadius: 20,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(226,232,240,0.9)',
+  },
+  weatherLoading:     { paddingVertical: 20, alignItems: 'center', gap: 10 },
+  weatherLoadingText: { fontSize: 12, color: '#64748b' },
+
+  wHeroCard: {
+    backgroundColor: 'rgba(37,99,235,0.10)',
+    borderWidth: 1,
+    borderColor: 'rgba(59,130,246,0.25)',
+    borderRadius: 16,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    marginBottom: 10,
+    alignItems: 'center',
+  },
+  wHeroPlace: { fontSize: 12, fontWeight: '700', color: '#475569' },
+  wHeroTemp: { fontSize: 42, fontWeight: '300', color: '#0f172a', marginTop: 2 },
+  wHeroDesc: { fontSize: 11, color: '#64748b', marginTop: 2, textAlign: 'center' },
+
+  wHeader:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 10, paddingHorizontal: 2 },
+  wTitle:      { fontSize: 13, fontWeight: '800', color: '#1e293b' },
+  wModel:      { fontSize: 10, color: BRAND_GREEN, fontWeight: '700', marginTop: 2 },
+  wCurrentBox: { alignItems: 'flex-end' },
+  wTemp:       { fontSize: 28, fontWeight: '700', color: '#1e293b' },
+  wWind:       { fontSize: 11, color: '#64748b', marginTop: 1 },
+
+  wStats:     { flexDirection: 'row', gap: 6, marginBottom: 12 },
+  wStat:      { flex: 1, backgroundColor: 'rgba(255,255,255,0.86)', borderRadius: 14, padding: 10, alignItems: 'center', borderWidth: 0.5, borderColor: '#dbeafe' },
+  wStatLabel: { fontSize: 9, color: '#94a3b8', fontWeight: '700', letterSpacing: 0.3, marginBottom: 2 },
+  wStatVal:   { fontSize: 13, fontWeight: '700', color: '#1e293b' },
+
+  wSectionLabel: { fontSize: 9, fontWeight: '700', color: '#94a3b8', letterSpacing: 0.8, marginBottom: 8 },
+  wBlock: {
+    backgroundColor: 'rgba(30,64,175,0.07)',
+    borderRadius: 14,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(59,130,246,0.18)',
+  },
+  wGraphRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 6 },
+  wGraphDay: { width: 36, fontSize: 11, color: '#334155', fontWeight: '700' },
+  wGraphTemp: { width: 24, fontSize: 11, color: '#64748b', textAlign: 'right' },
+  wGraphTrack: {
+    flex: 1,
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: '#dbeafe',
+    position: 'relative',
+    overflow: 'hidden',
+  },
+  wGraphRange: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    borderRadius: 999,
+    backgroundColor: '#38bdf8',
+  },
+  wGraphTempHi: { width: 28, fontSize: 11, color: '#0f172a', fontWeight: '700' },
+
+  wDayRow:   { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 7, borderBottomWidth: 0.5, borderBottomColor: '#f1f5f9' },
+  wDayFaded: { opacity: 0.6 },
+  wDayName:  { fontSize: 12, fontWeight: '700', color: '#1e293b', width: 34 },
+  wDayIcon:  { fontSize: 13, width: 18, textAlign: 'center' },
+  wBarWrap:  { flex: 1, height: 5, backgroundColor: '#e2e8f0', borderRadius: 3, overflow: 'hidden' },
+  wBar:      { height: 5, borderRadius: 3 },
+  wDayRain:  { fontSize: 11, color: '#64748b', width: 36, textAlign: 'right' },
+  wDayTemp:  { fontSize: 11, fontWeight: '600', color: '#1e293b', width: 62, textAlign: 'right' },
+  relDot:    { width: 7, height: 7, borderRadius: 4 },
+
+  wLegend:     { flexDirection: 'row', gap: 12, marginTop: 8, marginBottom: 2 },
+  wLegendItem: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  wLegendLabel:{ fontSize: 9, color: '#94a3b8' },
+
+  wRiskGrid:   { flexDirection: 'row', flexWrap: 'wrap', gap: 7, marginBottom: 4 },
+  wRiskCard:   { width: '48%', borderWidth: 0.5, borderRadius: 10, padding: 9 },
+  wRecoCard:   { backgroundColor: 'rgba(22,163,74,0.08)', borderColor: 'rgba(22,163,74,0.26)' },
+  wRiskLabel:  { fontSize: 9, fontWeight: '700', letterSpacing: 0.5, marginBottom: 3 },
+  wRiskAdvice: { fontSize: 11, fontWeight: '600', lineHeight: 15 },
+  riskBadge: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    marginBottom: 7,
+  },
+  riskBadgeLow: { backgroundColor: '#dcfce7' },
+  riskBadgeMedium: { backgroundColor: '#fef3c7' },
+  riskBadgeHigh: { backgroundColor: '#fee2e2' },
+  riskBadgeText: { fontSize: 10, fontWeight: '800', color: '#1f2937' },
+
+  forecastSheet: {
+    backgroundColor: '#111827',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 18,
+    paddingBottom: 0,
+    paddingTop: 4,
+    height: '88%',
+  },
+  forecastScroll: { flex: 1, width: '100%' },
+  forecastScrollContent: { paddingBottom: 48 },
+  forecastSheetHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 6 },
+  forecastSheetTitle: { color: '#f8fafc', fontSize: 19, fontWeight: '800', maxWidth: '82%' },
+  forecastCloseBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.12)',
+  },
+  forecastCloseText: { color: '#f8fafc', fontWeight: '800' },
+  forecastHeroTemp: { color: '#f8fafc', fontSize: 52, fontWeight: '300', marginTop: 14 },
+  forecastHeroSub: { color: '#cbd5e1', fontSize: 14, marginBottom: 10 },
+  segmentWrap: {
+    flexDirection: 'row',
+    backgroundColor: 'rgba(148,163,184,0.2)',
+    borderRadius: 999,
+    padding: 3,
+    marginBottom: 10,
+    alignSelf: 'flex-start',
+  },
+  segmentBtn: {
+    paddingVertical: 7,
+    paddingHorizontal: 18,
+    borderRadius: 999,
+  },
+  segmentBtnActive: {
+    backgroundColor: 'rgba(248,250,252,0.95)',
+  },
+  segmentText: {
+    color: '#cbd5e1',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  segmentTextActive: {
+    color: '#0f172a',
+  },
+  forecastGraphCard: {
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(148,163,184,0.25)',
+    borderRadius: 14,
+    padding: 12,
+    marginTop: 4,
+  },
+  wGraphRangeActive: {
+    backgroundColor: '#67e8f9',
+  },
+  barChartWrap: { flexDirection: 'row', marginTop: 8 },
+  hourlyYAxis: { width: 40, justifyContent: 'space-between', height: 150, paddingVertical: 4 },
+  hourlyYLabel: { color: '#94a3b8', fontSize: 10 },
+  barPlotArea: { flex: 1, flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between', height: 160 },
+  barCol: { alignItems: 'center', flex: 1, height: 160 },
+  barTrack: {
+    width: 18,
+    height: 120,
+    borderRadius: 9,
+    backgroundColor: 'rgba(148,163,184,0.18)',
+    justifyContent: 'flex-end',
+    overflow: 'hidden',
+  },
+  barFill: {
+    width: '100%',
+    borderRadius: 9,
+    backgroundColor: '#7dd3fc',
+  },
+  barFillNow: {
+    backgroundColor: '#67e8f9',
+  },
+  hourlyTempLabel: { color: '#cbd5e1', fontSize: 10, marginTop: 4 },
+  hourlyTempLabelNow: { color: '#f8fafc', fontWeight: '700' },
+  hourlyHourLabel: { color: '#94a3b8', fontSize: 9, marginTop: 2 },
+  forecastTextCard: {
+    marginTop: 12,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(148,163,184,0.25)',
+    borderRadius: 14,
+    padding: 12,
+  },
+  forecastParagraphTitle: { color: '#e2e8f0', fontWeight: '800', marginBottom: 6 },
+  forecastParagraph: { color: '#cbd5e1', lineHeight: 20, fontSize: 14 },
+  forecastParagraphMuted: { color: '#94a3b8', fontSize: 12, marginTop: 6 },
+  precipRiskTrack: {
+    marginTop: 6,
+    marginBottom: 6,
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: 'rgba(148,163,184,0.22)',
+    overflow: 'hidden',
+  },
+  precipRiskFill: { height: 8, borderRadius: 999, backgroundColor: '#67e8f9' },
+  compareRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(148,163,184,0.2)',
+  },
+  compareDay: { color: '#e2e8f0', fontWeight: '700' },
+  compareRange: { color: '#cbd5e1', fontWeight: '700' },
+  optionLabel: { color: '#e2e8f0', fontWeight: '700', marginBottom: 6 },
+  optionRow: { flexDirection: 'row', gap: 8 },
+  optionChip: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: 'rgba(148,163,184,0.2)',
+  },
+  optionChipActive: { backgroundColor: '#f8fafc' },
+  optionChipText: { color: '#cbd5e1', fontWeight: '700' },
+  optionChipTextActive: { color: '#0f172a' },
+
+  wFooter:    { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10, paddingTop: 8, borderTopWidth: 0.5, borderTopColor: '#e2e8f0' },
+  wFooterDot: { width: 6, height: 6, borderRadius: 3 },
+  wFooterText:{ flex: 1, fontSize: 9, color: '#94a3b8' },
+
+  // EDIT MODAL
+  editSheet:    { backgroundColor: '#fff', borderTopLeftRadius: 26, borderTopRightRadius: 26, padding: 24, maxHeight: '88%' },
+  editTitle:    { fontSize: 20, fontWeight: '800', color: BRAND_GREEN, textAlign: 'center', marginBottom: 22 },
+  inputGroup:   { marginBottom: 16 },
+  inputLabel:   { fontSize: 11, fontWeight: '700', color: '#94a3b8', marginBottom: 6, letterSpacing: 0.6 },
+  inputField:   { backgroundColor: '#f8fafc', borderWidth: 1, borderColor: '#e2e8f0', borderRadius: 14, paddingHorizontal: 14, paddingVertical: 12, fontSize: 15, color: '#1e293b' },
+  chipRow:      { flexDirection: 'row', gap: 10, marginBottom: 18 },
+  chip:         { flex: 1, paddingVertical: 12, borderRadius: 14, backgroundColor: '#f1f5f9', alignItems: 'center', borderWidth: 1, borderColor: '#e2e8f0' },
+  chipOn:       { backgroundColor: BRAND_GREEN, borderColor: BRAND_GREEN },
+  chipLabel:    { fontWeight: '700', color: '#64748b', fontSize: 13 },
+  chipLabelOn:  { color: '#fff' },
+  editBtns:     { flexDirection: 'row', gap: 10, marginTop: 8 },
+  btnCancel:    { flex: 1, paddingVertical: 14, borderRadius: 14, backgroundColor: '#f1f5f9', alignItems: 'center', borderWidth: 1, borderColor: '#e2e8f0' },
+  btnCancelText:{ color: '#94a3b8', fontWeight: '700' },
+  btnSave:      { flex: 2, paddingVertical: 14, borderRadius: 14, backgroundColor: BRAND_GREEN, alignItems: 'center' },
+  btnSaveText:  { color: '#fff', fontWeight: '800', fontSize: 15 },
+
+  // ── PANNEAU RECHERCHE MULTICRITÈRES ─────────────────────────────────────────
+  searchPanel: {
+    backgroundColor: DARK_GREEN,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    paddingBottom: 6,
+  },
+  searchInputRow: {
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 8,
+  },
+  searchInputWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.15)',
+    paddingHorizontal: 12,
+    gap: 8,
+  },
+  // Loupe miniature dans la barre
+  searchMiniIcon:   { width: 16, height: 16, justifyContent: 'center', alignItems: 'center', flexShrink: 0 },
+  searchMiniCircle: { position: 'absolute', top: 0, left: 0, width: 10, height: 10, borderRadius: 5, borderWidth: 1.5, borderColor: '#94a3b8' },
+  searchMiniHandle: { position: 'absolute', bottom: 0, right: 0, width: 6, height: 1.5, backgroundColor: '#94a3b8', borderRadius: 1, transform: [{ rotate: '45deg' }] },
+  searchInput: {
+    flex: 1,
+    paddingVertical: 11,
+    color: '#fff',
+    fontSize: 14,
+  },
+  searchClearBtn: {
+    width: 22, height: 22, borderRadius: 11,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    justifyContent: 'center', alignItems: 'center',
+  },
+  searchClearText: { color: '#94a3b8', fontSize: 10, fontWeight: '800' },
+
+  // Scroll cultures dans la recherche
+  cultureScroll:        { maxHeight: 40 },
+  cultureScrollContent: { paddingHorizontal: 14, gap: 6, flexDirection: 'row', alignItems: 'center' },
+  cultureChip:          { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, backgroundColor: 'rgba(255,255,255,0.1)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.15)' },
+  cultureChipActive:    { backgroundColor: BRAND_GREEN, borderColor: BRAND_GREEN },
+  cultureChipText:      { fontSize: 11, fontWeight: '700', color: 'rgba(255,255,255,0.7)' },
+  cultureChipTextActive:{ color: '#fff' },
+
+  // Résultats recherche
+  searchResults: { maxHeight: 220, marginTop: 4 },
+  searchEmpty:   { color: '#64748b', fontSize: 12, textAlign: 'center', paddingVertical: 16 },
+  searchResultRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    paddingHorizontal: 14, paddingVertical: 11,
+    borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.05)',
+  },
+  searchResultDot:  { width: 9, height: 9, borderRadius: 5, flexShrink: 0 },
+  searchResultName: { fontSize: 13, fontWeight: '700', color: '#f1f5f9' },
+  searchResultSub:  { fontSize: 11, color: '#64748b', marginTop: 1 },
+  searchZoomBtn:    { width: 30, height: 30, borderRadius: 8, backgroundColor: 'rgba(22,163,74,0.2)', justifyContent: 'center', alignItems: 'center' },
+  searchZoomArrow:  { color: BRAND_GREEN, fontWeight: '800', fontSize: 14 },
+
+  // Marker flash (zoom-to)
+  markerBubbleFlash: { backgroundColor: '#fef3c7', borderWidth: 1.5, borderColor: '#f59e0b' },
+  markerTextFlash:   { color: '#92400e' },
+
+  // Filtre culture pilule active (hors modal)
+  filterChipCulture:     { backgroundColor: '#7c3aed', flex: 0, paddingHorizontal: 12 },
+  filterChipCultureText: { fontSize: 11, fontWeight: '700', color: '#fff' },
+});

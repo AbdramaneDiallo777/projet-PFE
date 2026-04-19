@@ -1,0 +1,4 @@
+# Inférence Scan IA (Flask) — TensorFlow pour TFLite : voir README (souvent C:\tff sous Windows).
+flask>=3.0,<4
+numpy>=1.26,<3
+pillow>=10,<12

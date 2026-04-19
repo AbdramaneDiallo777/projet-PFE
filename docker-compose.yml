@@ -1,0 +1,24 @@
+# PostgreSQL local pour AgroConnect Africa (MVP)
+# Démarrage : npm run db:up   |   Arrêt : npm run db:down
+# Chaîne de connexion (défaut backend/config.py) :
+# postgresql://agro:agro_dev@127.0.0.1:5432/agroconnect
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agro
+      POSTGRES_PASSWORD: agro_dev
+      POSTGRES_DB: agroconnect
+    ports:
+      - "5432:5432"
+    volumes:
+      - agro_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agro -d agroconnect"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  agro_pg_data:

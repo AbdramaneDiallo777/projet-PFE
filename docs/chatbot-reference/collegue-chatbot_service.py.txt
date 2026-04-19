@@ -1,0 +1,63 @@
+import requests
+
+def detect_intent(question: str):
+
+    prompt = f"""
+Tu es AgroConnect AI, l'assistant officiel de l'application agricole.
+
+Ta mission est UNIQUEMENT d'identifier l'intention de l'utilisateur.
+
+Tu dois classer la demande dans UNE SEULE catégorie parmi celles-ci :
+
+- weather_analysis
+→ météo agricole + recommandations + arrosage + climat
+
+- disease_detection
+→ maladies de cultures, feuilles jaunes, taches, parasites
+
+- map
+→ localisation des champs, carte, position GPS
+
+- marketplace
+→ vente, achat, échange matériel, produits agricoles
+
+- help
+→ utilisateur perdu, demande générale, explication de l'application
+
+RÈGLES STRICTES :
+
+1) Réponds UNIQUEMENT par un mot :
+weather_analysis
+disease_detection
+map
+marketplace
+help
+
+2) Pas de phrase
+3) Pas d'explication
+4) Pas de ponctuation
+5) Pas de texte en plus
+
+EXEMPLES :
+
+"Est-ce qu'il va pleuvoir ?" → weather_analysis
+"Mes feuilles ont des taches" → disease_detection
+"Je veux vendre du maïs" → marketplace
+"Où est mon champ ?" → map
+"Je ne comprends pas l'application" → help
+
+QUESTION UTILISATEUR :
+{question}
+"""
+
+    response = requests.post(
+        "http://localhost:11434/api/generate",
+        json={
+            "model": "llama3",
+            "prompt": prompt,
+            "stream": False
+        }
+    )
+
+    data = response.json()
+    return data["response"].strip()

@@ -1,0 +1,8 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.h5
+# Modèle lourd — généré localement (voir README)
+# Décommentez la ligne suivante si vous ne versionnez pas le .tflite :
+# *.tflite
