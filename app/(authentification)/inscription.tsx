@@ -31,13 +31,6 @@ import {
 const MAX_WIDTH = 480;
 const GREEN_PRIMARY = '#065F46'; 
 
-function mapAppRoleToApi(role: string): string {
-    if (role === 'investor') return 'investisseur';
-    if (role === 'pro') return 'professionnel';
-    if (role === 'client') return 'client';
-    return 'agriculteur';
-}
-
 export default function RegisterScreen() {
     const router = useRouter(); // Hook de navigation
     const { register, isReady } = useAuth();
@@ -61,6 +54,11 @@ export default function RegisterScreen() {
             Alert.alert('Information', 'Veuillez remplir votre nom et votre email.');
             return;
         }
+        const emailTrim = form.email.trim();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailTrim)) {
+            Alert.alert('E-mail', 'Adresse e-mail invalide (ex. prenom@domaine.com).');
+            return;
+        }
         if (form.password.length < 8) {
             Alert.alert('Mot de passe', 'Au moins 8 caractères (exigence du serveur).');
             return;
@@ -72,11 +70,11 @@ export default function RegisterScreen() {
         setIsLoading(true);
         try {
             await register({
-                email: form.email.trim(),
+                email: emailTrim,
                 password: form.password,
                 full_name: form.name.trim(),
                 phone_number: form.phone.trim() || undefined,
-                role: mapAppRoleToApi(role),
+                role,
             });
             router.replace('/tableau-de-bord');
         } catch (e) {

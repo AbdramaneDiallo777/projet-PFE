@@ -542,8 +542,15 @@ async def create_order_with_items(
                     "SELECT id, price_cents, currency, quantity FROM products WHERE id = $1 FOR UPDATE",
                     pid,
                 )
-                if not pr or int(pr["quantity"]) < qty:
-                    raise ValueError(f"Produit indisponible: {pid}")
+                if not pr:
+                    raise ValueError(
+                        f"Produit introuvable (vérifiez que l’article existe encore sur le marché). ID : {pid}"
+                    )
+                stock = int(pr["quantity"])
+                if stock < qty:
+                    raise ValueError(
+                        f"Stock insuffisant pour ce produit (demandé : {qty}, disponible : {stock})."
+                    )
                 unit = int(pr["price_cents"])
                 currency = str(pr["currency"])
                 total += unit * qty

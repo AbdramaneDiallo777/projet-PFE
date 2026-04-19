@@ -11,15 +11,16 @@ import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import {
     Image,
-    SafeAreaView,
     ScrollView,
     StatusBar,
     StyleSheet,
     Text,
     TextInput,
     TouchableOpacity,
-    View
+    View,
+    useWindowDimensions,
 } from 'react-native';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 const MAX_WIDTH = 500;
 
@@ -38,9 +39,13 @@ const COUNTRIES = [
 
 export default function SelectionPays() {
     const router = useRouter();
+    const { width: SCREEN_WIDTH } = useWindowDimensions();
+    const insets = useSafeAreaInsets();
     const [selectedId, setSelectedId] = useState('sn');
     const [search, setSearch] = useState('');
     const [isFocused, setIsFocused] = useState(false);
+
+    const CONTAINER_WIDTH = SCREEN_WIDTH > MAX_WIDTH ? MAX_WIDTH : SCREEN_WIDTH;
 
     let [fontsLoaded] = useFonts({
         'PJS-Regular': PlusJakartaSans_400Regular,
@@ -66,12 +71,18 @@ export default function SelectionPays() {
 
     if (!fontsLoaded) return null;
 
+    const scrollBottomPad = Math.max(insets.bottom, 12) + 100;
+
     return (
         <View style={[styles.outerContainer, { backgroundColor: COLORS.outerBg }]}>
             <StatusBar barStyle="dark-content" />
-            <View style={[styles.innerContainer, { width: MAX_WIDTH, backgroundColor: COLORS.background }]}>
-                
-                <SafeAreaView style={styles.safeArea}>
+            <View
+                style={[
+                    styles.innerContainer,
+                    { width: CONTAINER_WIDTH, maxWidth: MAX_WIDTH, backgroundColor: COLORS.background },
+                ]}
+            >
+                <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
                     {/* Header avec Barre de Progression Dégradée */}
                     <View style={styles.header}>
                         <TouchableOpacity onPress={() => router.back()} style={[styles.backBtn, { backgroundColor: COLORS.card, borderColor: COLORS.border }]}>
@@ -91,7 +102,11 @@ export default function SelectionPays() {
                         <View style={{ width: 44 }} />
                     </View>
 
-                    <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent}>
+                    <ScrollView
+                        showsVerticalScrollIndicator={false}
+                        contentContainerStyle={[styles.scrollContent, { paddingBottom: scrollBottomPad }]}
+                        keyboardShouldPersistTaps="handled"
+                    >
                         <View style={styles.hero}>
                             <Text style={[styles.mainTitle, { color: COLORS.text }]}>
                                 Dans quel pays{"\n"}
@@ -156,7 +171,12 @@ export default function SelectionPays() {
                     </ScrollView>
 
                     {/* Footer - Bouton Dégradé */}
-                    <View style={styles.footer}>
+                    <View
+                        style={[
+                            styles.footer,
+                            { paddingBottom: Math.max(insets.bottom, 12), bottom: 0 },
+                        ]}
+                    >
                         <TouchableOpacity 
                             onPress={() => router.push('/(authentification)')} 
                             activeOpacity={0.8}
@@ -179,8 +199,8 @@ export default function SelectionPays() {
 }
 
 const styles = StyleSheet.create({
-    outerContainer: { flex: 1, alignItems: 'center' },
-    innerContainer: { flex: 1 },
+    outerContainer: { flex: 1, alignItems: 'center', width: '100%' },
+    innerContainer: { flex: 1, alignSelf: 'center', overflow: 'hidden' },
     safeArea: { flex: 1 },
     header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingTop: 10 },
     backBtn: { width: 44, height: 44, borderRadius: 12, justifyContent: 'center', alignItems: 'center', borderWidth: 1 },
@@ -189,9 +209,9 @@ const styles = StyleSheet.create({
     progressBarFill: { height: '100%', borderRadius: 10 },
     stepText: { fontSize: 10, fontFamily: 'PJS-ExtraBold', marginTop: 8, textTransform: 'uppercase', letterSpacing: 1 },
 
-    scrollContent: { paddingHorizontal: 25, paddingTop: 20, paddingBottom: 120 },
-    hero: { marginBottom: 25 },
-    mainTitle: { fontSize: 28, fontFamily: 'PJS-ExtraBold', lineHeight: 36 },
+    scrollContent: { paddingHorizontal: 20, paddingTop: 16 },
+    hero: { marginBottom: 20 },
+    mainTitle: { fontSize: 26, fontFamily: 'PJS-ExtraBold', lineHeight: 32 },
     subtitle: { fontSize: 14, fontFamily: 'PJS-Regular', marginTop: 10, lineHeight: 22 },
     
     searchWrapper: { 
@@ -216,14 +236,23 @@ const styles = StyleSheet.create({
     },
     flagContainer: { width: 44, height: 30, borderRadius: 6, overflow: 'hidden', backgroundColor: '#eee' },
     flagImg: { width: '100%', height: '100%' },
-    countryInfo: { flex: 1, marginLeft: 15 },
-    countryName: { fontSize: 15, fontFamily: 'PJS-Bold' },
-    countryRegion: { fontSize: 11, fontFamily: 'PJS-SemiBold', marginTop: 2 },
+    countryInfo: { flex: 1, marginLeft: 12, minWidth: 0 },
+    countryName: { fontSize: 15, fontFamily: 'PJS-Bold', flexShrink: 1 },
+    countryRegion: { fontSize: 11, fontFamily: 'PJS-SemiBold', marginTop: 2, flexShrink: 1 },
     
     radioOuter: { width: 22, height: 22, borderRadius: 11, borderWidth: 2 },
     radioActive: { width: 22, height: 22, borderRadius: 11, justifyContent: 'center', alignItems: 'center' },
 
-    footer: { position: 'absolute', bottom: 40, left: 0, right: 0, paddingHorizontal: 25 },
+    footer: {
+        position: 'absolute',
+        left: 0,
+        right: 0,
+        paddingHorizontal: 20,
+        backgroundColor: '#FFFFFF',
+        borderTopWidth: StyleSheet.hairlineWidth,
+        borderTopColor: '#F1F5F9',
+        paddingTop: 12,
+    },
     continueButton: {
         height: 60,
         borderRadius: 18,

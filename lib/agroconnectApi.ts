@@ -25,9 +25,25 @@ export function isOfflineDevToken(token: string | null | undefined): boolean {
   return token == null || token === "" || token === "dev-token";
 }
 
+/** Détails FastAPI/Pydantic 422 → message lisible (champ + msg). */
 function detailToMessage(detail: unknown): string {
   if (typeof detail === "string") return detail;
-  if (Array.isArray(detail)) return JSON.stringify(detail);
+  if (Array.isArray(detail)) {
+    const lines: string[] = [];
+    for (const item of detail) {
+      if (item != null && typeof item === "object" && "msg" in item) {
+        const rec = item as { loc?: unknown[]; msg?: string; type?: string };
+        const loc = Array.isArray(rec.loc)
+          ? rec.loc.filter((x) => x !== "body").join(" → ")
+          : "";
+        const msg = typeof rec.msg === "string" ? rec.msg : JSON.stringify(rec);
+        lines.push(loc ? `${loc}: ${msg}` : msg);
+      } else {
+        lines.push(JSON.stringify(item));
+      }
+    }
+    return lines.join("\n");
+  }
   if (detail != null && typeof detail === "object") return JSON.stringify(detail);
   return "";
 }
@@ -446,8 +462,8 @@ export type RegisterPayload = {
   location?: string;
 };
 
-function mapRegisterRoleToBackend(role?: string): string {
-  const x = (role || "farmer").toLowerCase();
+function mapRegisterRoleToBackend(role?: string): "farmer" | "company" | "client" {
+  const x = (role || "farmer").toLowerCase().trim();
   if (x === "farmer" || x === "agriculteur") return "farmer";
   if (x === "investor" || x === "investisseur") return "company";
   if (x === "pro" || x === "professionnel") return "company";
@@ -456,13 +472,14 @@ function mapRegisterRoleToBackend(role?: string): string {
 }
 
 export async function authRegister(payload: RegisterPayload): Promise<TokenResponse> {
+  const fullName = (payload.full_name ?? "").trim().slice(0, 200);
   const res = await apiFetch(`${API_BASE_URL}/api/auth/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       email: payload.email.trim(),
       password: payload.password,
-      full_name: payload.full_name ?? "",
+      full_name: fullName,
       role: mapRegisterRoleToBackend(payload.role),
     }),
   });
